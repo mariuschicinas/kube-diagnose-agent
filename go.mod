@@ -2,6 +2,8 @@ module kube-diagnose-agent
 
 go 1.26.0
 
+toolchain go1.26.9
+
 require (
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
