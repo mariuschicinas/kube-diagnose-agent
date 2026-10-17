@@ -1,5 +1,8 @@
 # kube-diagnose-agent
 
+![security](https://github.com/mariuschicinas/kube-diagnose-agent/actions/workflows/security.yml/badge.svg)
+![license](https://img.shields.io/badge/license-Apache%202.0-blue)
+
 A read-only Kubernetes diagnostic agent. Point it at a misbehaving Pod and it
 produces a structured root-cause analysis: likely causes with confidence and
 cited evidence, read-only next steps, and suggested remediation for a human to
