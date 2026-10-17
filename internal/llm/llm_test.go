@@ -45,3 +45,19 @@ func TestParseResultTextRejectsEmptyRCA(t *testing.T) {
 		})
 	}
 }
+
+// The probe and exec rules are load-bearing: they correct reasoning errors
+// observed in real runs. Guard them against being edited out.
+func TestSystemPromptKeepsKubernetesFacts(t *testing.T) {
+	for _, must := range []string{
+		"READINESS probe never restarts",
+		"LIVENESS",
+		"Exit code 137 means SIGKILL",
+		"Never suggest `kubectl exec`",
+		"is unknown, not \"missing\"",
+	} {
+		if !strings.Contains(systemPrompt, must) {
+			t.Errorf("system prompt lost required rule containing %q", must)
+		}
+	}
+}
