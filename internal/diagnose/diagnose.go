@@ -139,7 +139,11 @@ func safe(s string) string {
 		if r == '\n' || r == '\t' {
 			return r
 		}
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+		// Cc control chars (ANSI escapes, BEL, NUL, CR), line/paragraph
+		// separators, and Cf format chars — which include the bidi overrides
+		// (U+202A-202E, U+2066-2069) used in "trojan source" attacks to make
+		// text display differently from what it contains.
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r
