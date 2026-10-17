@@ -105,10 +105,10 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 
 	var trace []string
 	for round := 0; ; round++ {
-		// Hard cap: maxIter tool rounds plus one forced-conclusion round. A
-		// backend that keeps emitting tool calls must not be able to spin the
-		// loop until the context deadline (each round costs an API call).
-		if round > p.maxIter+1 {
+		// Hard cap: maxIter tool rounds plus one forced-conclusion round. With
+		// the offered-tools check below this cannot normally trigger; it stays as
+		// a backstop so no code path can spin the loop until the deadline.
+		if round > p.maxIter {
 			return nil, trace, fmt.Errorf("model did not conclude within %d rounds", p.maxIter+1)
 		}
 		offerTools := tp != nil && round < p.maxIter
@@ -144,6 +144,14 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 			}
 			res, err := parseResultText(text.String())
 			return res, trace, err
+		}
+
+		// Tools are executed only in rounds where they were offered. A backend
+		// that returns tool calls anyway (weaker openai-compat models do) is an
+		// error, not something to act on — and with --max-iterations 0 there is
+		// no tool provider at all, so calling it would panic.
+		if !offerTools || tp == nil {
+			return nil, trace, fmt.Errorf("model requested tools in round %d, where none were offered", round)
 		}
 
 		var results []anthBlock

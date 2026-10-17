@@ -168,10 +168,10 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 
 	var trace []string
 	for round := 0; ; round++ {
-		// Hard cap: maxIter tool rounds plus one forced-conclusion round. Weaker
-		// backends may return tool_calls even when no tools are offered; without
-		// this the loop would spin until the context deadline.
-		if round > p.maxIter+1 {
+		// Hard cap: maxIter tool rounds plus one forced-conclusion round. With
+		// the offered-tools check below this cannot normally trigger; it stays as
+		// a backstop so no code path can spin the loop until the deadline.
+		if round > p.maxIter {
 			return nil, trace, fmt.Errorf("model did not conclude within %d rounds", p.maxIter+1)
 		}
 		offerTools := tp != nil && round < p.maxIter
@@ -198,6 +198,14 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 		if len(msg.ToolCalls) == 0 {
 			res, err := parseResultText(msg.Content)
 			return res, trace, err
+		}
+
+		// Tools are executed only in rounds where they were offered. A backend
+		// that returns tool calls anyway (weaker openai-compat models do) is an
+		// error, not something to act on — and with --max-iterations 0 there is
+		// no tool provider at all, so calling it would panic.
+		if !offerTools || tp == nil {
+			return nil, trace, fmt.Errorf("model requested tools in round %d, where none were offered", round)
 		}
 
 		// Echo the assistant's tool-call turn back, then append one tool result
