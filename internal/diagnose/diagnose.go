@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 
 	"kube-diagnose-agent/internal/audit"
 	"kube-diagnose-agent/internal/collect"
@@ -129,12 +130,29 @@ func RenderJSON(w io.Writer, r *llm.Result) error {
 	return enc.Encode(r)
 }
 
+// safe strips control characters (everything except \n and \t) from model
+// output before it reaches the operator's terminal. Model text is derived from
+// attacker-influenceable logs; an ANSI escape sequence smuggled through the
+// model must not be able to rewrite what the operator sees.
+func safe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // RenderText writes a compact human-readable report. trace lists the tool calls
-// the agent made (may be empty).
+// the agent made (may be empty). All model-derived strings are passed through
+// safe() first.
 func RenderText(w io.Writer, ns, pod string, r *llm.Result, trace []string) {
 	fmt.Fprintf(w, "\nRCA for %s/%s\n", ns, pod)
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 60))
-	fmt.Fprintf(w, "Summary: %s\n", r.Summary)
+	fmt.Fprintf(w, "Summary: %s\n", safe(r.Summary))
 	if r.InsufficientEvidence {
 		fmt.Fprintln(w, "\n[!] Insufficient evidence — the steps below would disambiguate.")
 	}
@@ -142,31 +160,31 @@ func RenderText(w io.Writer, ns, pod string, r *llm.Result, trace []string) {
 	if len(r.LikelyCauses) > 0 {
 		fmt.Fprintln(w, "\nLikely causes:")
 		for i, c := range r.LikelyCauses {
-			fmt.Fprintf(w, "  %d. [%s] %s\n", i+1, strings.ToUpper(c.Confidence), c.Cause)
+			fmt.Fprintf(w, "  %d. [%s] %s\n", i+1, safe(strings.ToUpper(c.Confidence)), safe(c.Cause))
 			for _, e := range c.Evidence {
-				fmt.Fprintf(w, "       - %s\n", e)
+				fmt.Fprintf(w, "       - %s\n", safe(e))
 			}
 		}
 	}
 	if len(r.RecommendedNextSteps) > 0 {
 		fmt.Fprintln(w, "\nNext steps (read-only):")
 		for _, s := range r.RecommendedNextSteps {
-			fmt.Fprintf(w, "  - %s\n", s)
+			fmt.Fprintf(w, "  - %s\n", safe(s))
 		}
 	}
 	if len(r.SuggestedRemediation) > 0 {
 		fmt.Fprintln(w, "\nSuggested remediation (review before applying):")
 		for _, s := range r.SuggestedRemediation {
-			fmt.Fprintf(w, "  - %s\n", s)
+			fmt.Fprintf(w, "  - %s\n", safe(s))
 		}
 	}
 	if strings.TrimSpace(r.Notes) != "" {
-		fmt.Fprintf(w, "\nNotes: %s\n", r.Notes)
+		fmt.Fprintf(w, "\nNotes: %s\n", safe(r.Notes))
 	}
 	if len(trace) > 0 {
 		fmt.Fprintln(w, "\nAgent investigated (read-only tool calls):")
 		for _, t := range trace {
-			fmt.Fprintf(w, "  - %s\n", t)
+			fmt.Fprintf(w, "  - %s\n", safe(t))
 		}
 	}
 }
