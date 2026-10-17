@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -104,6 +105,12 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 
 	var trace []string
 	for round := 0; ; round++ {
+		// Hard cap: maxIter tool rounds plus one forced-conclusion round. A
+		// backend that keeps emitting tool calls must not be able to spin the
+		// loop until the context deadline (each round costs an API call).
+		if round > p.maxIter+1 {
+			return nil, trace, fmt.Errorf("model did not conclude within %d rounds", p.maxIter+1)
+		}
 		offerTools := tp != nil && round < p.maxIter
 
 		req := anthReq{
@@ -176,7 +183,7 @@ func (p *anthropicProvider) call(ctx context.Context, req anthReq) (*anthResp, e
 	defer resp.Body.Close()
 
 	var ar anthResp
-	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&ar); err != nil {
 		return nil, fmt.Errorf("decode api response (status %d): %w", resp.StatusCode, err)
 	}
 	if ar.Error != nil {

@@ -30,6 +30,11 @@ func SystemPrompt() string { return systemPrompt }
 const (
 	defaultTimeout = 90 * time.Second
 
+	// maxResponseBytes bounds how much of an LLM backend's response body we
+	// will read. A hostile or broken --base-url endpoint must not be able to
+	// exhaust memory; an RCA is a few KB.
+	maxResponseBytes = 8 << 20
+
 	// DefaultAnthropicModel is used when --provider=anthropic.
 	DefaultAnthropicModel = "claude-sonnet-4-6"
 	// DefaultOpenAICompatModel is a placeholder; self-hosted deployments must
