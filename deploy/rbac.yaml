@@ -26,6 +26,15 @@ rules:
     resources:
       - pods/log
     verbs: ["get"]
+  # Needed by the get_service / get_endpoints read-only tools (internal/tools).
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["list"]
   - apiGroups: ["apps"]
     resources:
       - deployments
