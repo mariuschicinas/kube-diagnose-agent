@@ -35,7 +35,7 @@ clean:
 # Install the scanners into $(go env GOPATH)/bin. Ensure that is on your PATH.
 tools:
 	go install golang.org/x/vuln/cmd/govulncheck@latest
-	go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+	go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
 
 # govulncheck: Go's official scanner. Does REACHABILITY analysis — it only
 # reports a CVE if the vulnerable function is actually callable from this code,
