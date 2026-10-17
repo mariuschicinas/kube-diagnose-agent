@@ -1,0 +1,18 @@
+# Keeps the SHA-pinned actions in .github/workflows and the Go module graph
+# current. Dependabot updates both the SHA and the "# vX.Y.Z" comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # client-go moves with the Kubernetes release train; group its parts so
+    # k8s.io/api, apimachinery and client-go bump together.
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"

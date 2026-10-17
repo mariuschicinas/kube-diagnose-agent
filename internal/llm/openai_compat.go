@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -50,6 +53,14 @@ func newOpenAICompat(c Config) (Provider, error) {
 	if c.APIKeyEnv != "" {
 		key = os.Getenv(c.APIKeyEnv)
 	}
+	// A bearer token over plaintext HTTP to a non-local host leaks the key to
+	// anyone on the path. Warn loudly; do not block (in-VPC http is a valid
+	// operator choice).
+	if key != "" {
+		if u, perr := url.Parse(base); perr == nil && u.Scheme == "http" && !isLocalHost(u.Hostname()) {
+			fmt.Fprintf(os.Stderr, "WARNING: --base-url %s uses plaintext http with an API key; the key is sent unencrypted\n", base)
+		}
+	}
 	return &openAICompatProvider{
 		httpc:     &http.Client{Timeout: defaultTimeout},
 		baseURL:   base,
@@ -58,6 +69,19 @@ func newOpenAICompat(c Config) (Provider, error) {
 		maxTokens: maxTokens,
 		maxIter:   c.MaxIterations,
 	}, nil
+}
+
+// isLocalHost reports whether host is loopback or a private (RFC 1918 / ULA)
+// address, where plaintext HTTP is an acceptable operator choice.
+func isLocalHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // a DNS name: assume it may leave the host
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
 }
 
 // --- wire types (OpenAI chat-completions shape) ---
@@ -144,6 +168,12 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 
 	var trace []string
 	for round := 0; ; round++ {
+		// Hard cap: maxIter tool rounds plus one forced-conclusion round. With
+		// the offered-tools check below this cannot normally trigger; it stays as
+		// a backstop so no code path can spin the loop until the deadline.
+		if round > p.maxIter {
+			return nil, trace, fmt.Errorf("model did not conclude within %d rounds", p.maxIter+1)
+		}
 		offerTools := tp != nil && round < p.maxIter
 		messages[0].Content = systemFor(offerTools)
 
@@ -168,6 +198,14 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 		if len(msg.ToolCalls) == 0 {
 			res, err := parseResultText(msg.Content)
 			return res, trace, err
+		}
+
+		// Tools are executed only in rounds where they were offered. A backend
+		// that returns tool calls anyway (weaker openai-compat models do) is an
+		// error, not something to act on — and with --max-iterations 0 there is
+		// no tool provider at all, so calling it would panic.
+		if !offerTools || tp == nil {
+			return nil, trace, fmt.Errorf("model requested tools in round %d, where none were offered", round)
 		}
 
 		// Echo the assistant's tool-call turn back, then append one tool result
@@ -221,7 +259,7 @@ func (p *openAICompatProvider) call(ctx context.Context, req oaiReq) (*oaiResp, 
 	defer resp.Body.Close()
 
 	var or oaiResp
-	if err := json.NewDecoder(resp.Body).Decode(&or); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&or); err != nil {
 		return nil, fmt.Errorf("decode response (status %d) from %s: %w", resp.StatusCode, url, err)
 	}
 	if or.Error != nil {

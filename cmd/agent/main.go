@@ -56,7 +56,7 @@ Usage:
 
 Flags:
   -n, --namespace   namespace of the pod (required)
-      --kubeconfig      path to kubeconfig (default: in-cluster, then $KUBECONFIG, then ~/.kube/config)
+      --kubeconfig      path to kubeconfig (precedence: flag, in-cluster, $KUBECONFIG, ~/.kube/config)
       --provider        LLM backend: anthropic | openai-compat (default: anthropic)
       --model           model name (default: `+llm.DefaultAnthropicModel+` for anthropic)
       --base-url        endpoint for openai-compat, e.g. http://localhost:11434/v1
@@ -180,12 +180,15 @@ func runDiagnose(args []string) error {
 	return nil
 }
 
-// newClientset prefers in-cluster config, then an explicit/standard kubeconfig.
+// newClientset resolves the cluster config in this order: an explicit
+// --kubeconfig flag, in-cluster config, $KUBECONFIG, ~/.kube/config. An explicit
+// flag always wins — it must never be silently overridden by the environment the
+// binary happens to run in.
 func newClientset(kubeconfig string) (kubernetes.Interface, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return kubernetes.NewForConfig(cfg)
-	}
 	if kubeconfig == "" {
+		if cfg, err := rest.InClusterConfig(); err == nil {
+			return kubernetes.NewForConfig(cfg)
+		}
 		if env := os.Getenv("KUBECONFIG"); env != "" {
 			kubeconfig = env
 		} else if home, _ := os.UserHomeDir(); home != "" {

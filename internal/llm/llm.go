@@ -30,6 +30,11 @@ func SystemPrompt() string { return systemPrompt }
 const (
 	defaultTimeout = 90 * time.Second
 
+	// maxResponseBytes bounds how much of an LLM backend's response body we
+	// will read. A hostile or broken --base-url endpoint must not be able to
+	// exhaust memory; an RCA is a few KB.
+	maxResponseBytes = 8 << 20
+
 	// DefaultAnthropicModel is used when --provider=anthropic.
 	DefaultAnthropicModel = "claude-sonnet-4-6"
 	// DefaultOpenAICompatModel is a placeholder; self-hosted deployments must
@@ -151,6 +156,14 @@ func parseResultText(text string) (*Result, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &out); err != nil {
 		return nil, fmt.Errorf("parse model JSON: %w\nraw model output:\n%s", err, text)
 	}
+	// A JSON object that parses but carries no summary is not an RCA — for
+	// example a stray object the model echoed from attacker-controlled logs.
+	// Rendering it would print an empty report that reads as "nothing found",
+	// which is the worst way for a diagnostic tool to fail. Fail loudly instead.
+	if strings.TrimSpace(out.Summary) == "" {
+		return nil, fmt.Errorf("model returned no usable RCA (empty summary)\nraw model output:\n%s", text)
+	}
+	enforceReadOnlySteps(&out)
 	return &out, nil
 }
 

@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
 
+# Third-party actions are pinned to full commit SHAs (the version tag is kept
+# as a comment for readability). A moving tag like @v4 can be re-pointed by the
+# action's maintainer or an attacker who compromises them; a SHA cannot. Bump
+# via Dependabot (.github/dependabot.yml) or by hand.
 permissions:
   contents: read
 
@@ -16,9 +20,9 @@ jobs:
     name: supply chain scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26"
           check-latest: true
@@ -39,18 +43,18 @@ jobs:
       # Reachability-aware: only fails on vulnerabilities actually callable from
       # this code. This gate is meant to be enforcing, not advisory.
       - name: govulncheck
-        uses: golang/govulncheck-action@v1
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           go-version-input: "1.26"
           repo-checkout: false
 
       - name: Generate SBOM (CycloneDX)
         run: |
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
           cyclonedx-gomod mod -json -output sbom.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom-cyclonedx
           path: sbom.json
@@ -59,7 +63,7 @@ jobs:
     name: runtime posture checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # These greps are cheap regression tests for the security architecture.
       # They are here so that a future refactor cannot silently remove a control.
@@ -67,13 +71,33 @@ jobs:
         run: |
           # Inspect only the verbs: lines — not comments, which legitimately
           # mention write verbs when explaining their absence.
-          if grep -E '^\s*verbs:' deploy/rbac.yaml \
-             | grep -Eq '(create|update|patch|delete|deletecollection|impersonate|escalate|bind)'; then
-            echo "::error::deploy/rbac.yaml grants a write verb — the agent must stay read-only"
-            grep -nE '^\s*verbs:' deploy/rbac.yaml
-            exit 1
-          fi
+          for f in deploy/rbac.yaml deploy/rbac-namespaced.yaml; do
+            if grep -E '^\s*verbs:' "$f" \
+               | grep -Eq '(create|update|patch|delete|deletecollection|impersonate|escalate|bind)'; then
+              echo "::error::$f grants a write verb — the agent must stay read-only"
+              grep -nE '^\s*verbs:' "$f"
+              exit 1
+            fi
+          done
           echo "OK: RBAC grants only read verbs"
+
+      - name: RBAC must cover every resource the tools read
+        run: |
+          # internal/tools and internal/collect read these resources. A tool
+          # that the ServiceAccount cannot actually use fails with 403 at
+          # runtime; this catches the manifest drifting from the code.
+          # Limitation: the resource list below is maintained by hand. When a
+          # tool starts reading a new resource, add it here too. The check also
+          # does not verify apiGroup or verb — review those in the manifest.
+          for f in deploy/rbac.yaml deploy/rbac-namespaced.yaml; do
+            for res in pods events pods/log services endpointslices deployments replicasets statefulsets daemonsets jobs; do
+              grep -Eq "^\s*- ${res}\s*$" "$f" || {
+                echo "::error::$f does not grant '${res}', which the agent reads"
+                exit 1
+              }
+            done
+          done
+          echo "OK: RBAC covers every resource the agent reads"
 
       - name: Namespace allowlist must be enforced in tools
         run: |
@@ -105,6 +129,17 @@ jobs:
             exit 1
           fi
           echo "OK: no tool reads Secret contents"
+
+      - name: Next steps must be filtered to read-only commands
+        run: |
+          # The prompt forbids exec/mutating commands as "next steps", but a
+          # prompt rule is probabilistic. The deterministic filter in
+          # internal/llm must stay wired into result parsing.
+          grep -q 'enforceReadOnlySteps(&out)' internal/llm/llm.go || {
+            echo "::error::read-only next-step filter is not applied to model results"
+            exit 1
+          }
+          echo "OK: next steps are filtered to read-only commands"
 
       - name: Redaction must be applied to egress
         run: |

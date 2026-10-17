@@ -1,0 +1,81 @@
+# Namespace-scoped RBAC for the diagnose agent — the recommended deployment.
+#
+# deploy/rbac.yaml binds the read-only ClusterRole cluster-wide: the agent's
+# ServiceAccount can read Pods and logs in EVERY namespace, including
+# kube-system. The in-code namespace allowlist (internal/tools) limits what the
+# model can ask for during one run, but it does not limit what the token itself
+# can do: anyone holding the ServiceAccount token, or a process that compromises
+# the agent Pod, can read any namespace with plain kubectl.
+#
+# This manifest keeps the same ClusterRole (so the verb set stays in one place
+# and the CI posture check covers it) but grants it per namespace with a
+# RoleBinding. The token can then only read the namespaces listed here. Add one
+# RoleBinding per namespace the agent is allowed to diagnose.
+#
+# Apply: kubectl apply -f deploy/rbac-namespaced.yaml
+#
+# Do NOT also apply deploy/rbac.yaml: its ClusterRoleBinding would re-widen the
+# grant to the whole cluster.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: diagnostics
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: diagnose-agent
+  namespace: diagnostics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: diagnose-agent-readonly
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - events
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs: ["get"]
+  # Needed by the get_service / get_endpoints read-only tools (internal/tools).
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["list"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+    verbs: ["get", "list", "watch"]
+---
+# One RoleBinding per namespace the agent may diagnose. The roleRef points at
+# the ClusterRole above; because the binding is a RoleBinding, the permissions
+# apply only inside metadata.namespace. Copy this block for each namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: diagnose-agent-readonly
+  namespace: demo # <- change to the namespace the agent may read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: diagnose-agent-readonly
+subjects:
+  - kind: ServiceAccount
+    name: diagnose-agent
+    namespace: diagnostics

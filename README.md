@@ -35,9 +35,14 @@ could defend to a regulated financial-services security team. Two principles:
 
 1. **The LLM never touches the cluster.** It only ever sees a text bundle that
    *your* code assembled. All Kubernetes access is read-only client-go (get /
-   list / watch / pods/log) running under a ServiceAccount with no write verbs —
-   see [`deploy/rbac.yaml`](deploy/rbac.yaml). Read-only is an RBAC boundary, not
-   a code convention.
+   list / watch / pods/log) running under a ServiceAccount with no write verbs.
+   Read-only is an RBAC boundary, not a code convention. Two manifests ship:
+   [`deploy/rbac-namespaced.yaml`](deploy/rbac-namespaced.yaml) (recommended —
+   one RoleBinding per namespace the agent may diagnose, so the token itself
+   cannot read anywhere else) and [`deploy/rbac.yaml`](deploy/rbac.yaml)
+   (cluster-wide read, for clusters where every namespace is in scope). CI
+   checks both for write verbs and for drift against the resources the code
+   actually reads.
 
 2. **Redaction is a fixed choke point.** Every byte of the bundle passes through
    [`internal/redact`](internal/redact/redact.go) before it leaves the process:
@@ -87,7 +92,8 @@ instance is where CrashLoopBackOff hides), and a summary of the owning workload
 
 ## Setup
 
-Requires Go 1.23+ and an Anthropic API key.
+Requires Go 1.26+ (the version pinned in `go.mod`; `go` downloads it automatically
+if your local toolchain is older) and an Anthropic API key.
 
 ```bash
 go mod tidy            # populate the dependency graph

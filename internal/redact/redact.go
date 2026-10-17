@@ -51,7 +51,7 @@ var rules = []rule{
 	{regexp.MustCompile(`xox[baprs]-[0-9A-Za-z-]{10,}`), "[REDACTED_SLACK_TOKEN]"},
 	{regexp.MustCompile(`https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+`), "[REDACTED_SLACK_WEBHOOK]"},
 
-	// --- LLM provider keys (the agent reads pod env; a pod may carry one) ---
+	// --- LLM provider keys (a crashing app may print its own key in a log line) ---
 	// Anthropic (checked before the broader OpenAI rule).
 	{regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{20,}`), "[REDACTED_LLM_KEY]"},
 	// OpenAI (sk- and sk-proj-).
