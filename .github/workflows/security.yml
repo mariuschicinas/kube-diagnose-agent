@@ -130,6 +130,17 @@ jobs:
           fi
           echo "OK: no tool reads Secret contents"
 
+      - name: Next steps must be filtered to read-only commands
+        run: |
+          # The prompt forbids exec/mutating commands as "next steps", but a
+          # prompt rule is probabilistic. The deterministic filter in
+          # internal/llm must stay wired into result parsing.
+          grep -q 'enforceReadOnlySteps(&out)' internal/llm/llm.go || {
+            echo "::error::read-only next-step filter is not applied to model results"
+            exit 1
+          }
+          echo "OK: next steps are filtered to read-only commands"
+
       - name: Redaction must be applied to egress
         run: |
           grep -q 'redact.Scrub' internal/diagnose/diagnose.go || {

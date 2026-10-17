@@ -163,6 +163,7 @@ func parseResultText(text string) (*Result, error) {
 	if strings.TrimSpace(out.Summary) == "" {
 		return nil, fmt.Errorf("model returned no usable RCA (empty summary)\nraw model output:\n%s", text)
 	}
+	enforceReadOnlySteps(&out)
 	return &out, nil
 }
 
