@@ -86,6 +86,9 @@ jobs:
           # internal/tools and internal/collect read these resources. A tool
           # that the ServiceAccount cannot actually use fails with 403 at
           # runtime; this catches the manifest drifting from the code.
+          # Limitation: the resource list below is maintained by hand. When a
+          # tool starts reading a new resource, add it here too. The check also
+          # does not verify apiGroup or verb — review those in the manifest.
           for f in deploy/rbac.yaml deploy/rbac-namespaced.yaml; do
             for res in pods events pods/log services endpointslices deployments replicasets statefulsets daemonsets jobs; do
               grep -Eq "^\s*- ${res}\s*$" "$f" || {
