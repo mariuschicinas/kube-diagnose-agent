@@ -1,0 +1,119 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # New CVEs land against unchanged code, so scan on a schedule too.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    name: supply chain scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          check-latest: true
+
+      # Fails if any module does not match its go.sum hash.
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # Reachability-aware: only fails on vulnerabilities actually callable from
+      # this code. This gate is meant to be enforcing, not advisory.
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.23"
+          repo-checkout: false
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          cyclonedx-gomod mod -json -output sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+
+  posture:
+    name: runtime posture checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # These greps are cheap regression tests for the security architecture.
+      # They are here so that a future refactor cannot silently remove a control.
+      - name: RBAC must contain no write verbs
+        run: |
+          # Inspect only the verbs: lines — not comments, which legitimately
+          # mention write verbs when explaining their absence.
+          if grep -E '^\s*verbs:' deploy/rbac.yaml \
+             | grep -Eq '(create|update|patch|delete|deletecollection|impersonate|escalate|bind)'; then
+            echo "::error::deploy/rbac.yaml grants a write verb — the agent must stay read-only"
+            grep -nE '^\s*verbs:' deploy/rbac.yaml
+            exit 1
+          fi
+          echo "OK: RBAC grants only read verbs"
+
+      - name: Namespace allowlist must be enforced in tools
+        run: |
+          grep -q 'allowedNS' internal/tools/tools.go || {
+            echo "::error::namespace allowlist missing from internal/tools — cross-namespace reads would be possible"
+            exit 1
+          }
+          echo "OK: namespace allowlist present"
+
+      - name: No exec/attach/portforward tool may exist
+        run: |
+          if grep -Eq '"(exec|attach|portforward)"' internal/tools/tools.go; then
+            echo "::error::an exec-class tool was added — this breaks the read-only guarantee"
+            exit 1
+          fi
+          echo "OK: no exec-class tools"
+
+      - name: No tool may read Secret contents
+        run: |
+          # The tool surface is the blast radius. A tool that returns Secret
+          # .Data into the model's context is an exfiltration path that no
+          # namespace allowlist can close (the attacker just targets the
+          # allowed namespace). Reading a Secret's .Data or .StringData is
+          # therefore forbidden outright. Existence/metadata checks are fine.
+          if grep -Eq '\.(Data|StringData)\b' internal/tools/tools.go \
+             || grep -Eiq 'Secrets\([^)]*\)\.Get' internal/tools/tools.go; then
+            echo "::error::a tool reads Secret contents — secret material must never enter the model context"
+            grep -nE '\.(Data|StringData)\b|Secrets\([^)]*\)\.Get' internal/tools/tools.go
+            exit 1
+          fi
+          echo "OK: no tool reads Secret contents"
+
+      - name: Redaction must be applied to egress
+        run: |
+          grep -q 'redact.Scrub' internal/diagnose/diagnose.go || {
+            echo "::error::bundle is not scrubbed before egress"
+            exit 1
+          }
+          grep -q 'redact.Scrub' internal/tools/tools.go || {
+            echo "::error::tool results are not scrubbed before returning to the model"
+            exit 1
+          }
+          echo "OK: redaction applied to both bundle and tool results"

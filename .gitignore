@@ -1,0 +1,15 @@
+/bin/
+*.exe
+.env
+kubeconfig
+*.log
+
+# Generated security artifacts — regenerate with `make security`.
+# (Committing them would go stale silently; CI regenerates on every push.)
+security-report.md
+sbom.json
+
+# NOTE: vendor/ is deliberately NOT ignored. Committing the vendored dependency
+# source makes builds reproducible and lets an auditor read every line of
+# third-party code that ends up in the binary — worth the repo size for a tool
+# that is pitched on supply-chain posture.
