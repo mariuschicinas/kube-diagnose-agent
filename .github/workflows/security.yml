@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
           check-latest: true
 
       # Fails if any module does not match its go.sum hash.
@@ -41,7 +41,7 @@ jobs:
       - name: govulncheck
         uses: golang/govulncheck-action@v1
         with:
-          go-version-input: "1.23"
+          go-version-input: "1.26"
           repo-checkout: false
 
       - name: Generate SBOM (CycloneDX)
