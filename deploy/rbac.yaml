@@ -1,8 +1,15 @@
-# Read-only RBAC for the diagnose agent. The agent can only get/list/watch the
-# resources it needs to build a diagnostic bundle, and read pod logs. It has NO
-# write/patch/delete/exec permissions anywhere. Read-only is enforced at the
-# RBAC layer, not just in code — apply this and the worst a compromised agent
-# can do is read.
+# Read-only RBAC for the diagnose agent — CLUSTER-WIDE variant.
+#
+# The agent can only get/list/watch the resources it needs to build a
+# diagnostic bundle, and read pod logs. It has NO write/patch/delete/exec
+# permissions anywhere. Read-only is enforced at the RBAC layer, not just in
+# code — apply this and the worst a compromised agent can do is read.
+#
+# "Read" is still cluster-wide here: the ClusterRoleBinding lets this token read
+# Pods and logs in every namespace, kube-system included. The in-code namespace
+# allowlist bounds a single run, not the token. If the agent should only ever
+# diagnose a known set of namespaces, prefer deploy/rbac-namespaced.yaml, which
+# grants the same ClusterRole per namespace via RoleBindings.
 #
 # Apply: kubectl apply -f deploy/rbac.yaml
 ---
