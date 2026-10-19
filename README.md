@@ -106,12 +106,6 @@ Flags: `--json`, `--show-bundle`, `--model`, `--tail`, `--max-tokens`,
 `--kubeconfig`. The client prefers in-cluster config, then `$KUBECONFIG`, then
 `~/.kube/config`.
 
-> The module is named `kube-diagnose-agent` (a local name — Go never fetches your
-> own module, so this builds offline-of-itself). If you later publish it or want
-> others to `go install` it, change the module path in `go.mod` to a real one
-> (e.g. `github.com/you/kube-diagnose-agent`) and update the internal imports to
-> match.
-
 ## LLM backends
 
 The agent is provider-agnostic and **operates no inference service of its own** —
@@ -149,6 +143,12 @@ weaker refusal behaviour. That does not weaken the security model — it is exac
 why the hard boundaries live in code. **The weaker the model, the more the
 allowlist earns its keep.**
 
+This is observed, not hypothetical: on the `injection-naive` scenario, a
+self-hosted Qwen2.5-14B-Instruct (vLLM) followed the injected instruction and
+called `get_pod` on `kube-system/vault-0`. The allowlist refused the call, the
+report flagged it as likely prompt injection, and the refusal is in the audit
+log. Claude, on the same bundle, ignored the payload and made no tool calls.
+
 ## Roadmap
 
 - **v1 — tool-use loop.** ✅ Done. Read-only tools (`get_service`,
@@ -156,9 +156,18 @@ allowlist earns its keep.**
 - **next — more read-only tools.** Optional Prometheus query tool; `list_pods`
   by selector; dependency-Pod logs — each added only when a failure mode needs
   it.
-- **later — compliance layer.** Persist the tool-call trace as a structured
-  audit log (what was read, when), optional self-hosted inference so no log
-  leaves the cluster.
+- **done — audit trail and self-hosted inference.** Every run can write a
+  structured JSON audit record (`--audit-log`): model, prompt and bundle
+  digests, every tool call, and refusals. The `openai-compat` backend has been
+  run end to end against vLLM.
+
+## How this was built
+
+This project was built with substantial AI assistance: most of the code was
+written in pair-programming sessions with Claude (Anthropic). The problem
+framing, security requirements and design decisions, testing against real
+clusters, and review of every change are mine. Findings from an independent
+security review were fixed through the same process.
 
 ## License
 
