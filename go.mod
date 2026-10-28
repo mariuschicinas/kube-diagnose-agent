@@ -5,6 +5,7 @@ go 1.26.0
 toolchain go1.26.9
 
 require (
+	golang.org/x/text v0.42.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
@@ -55,16 +56,14 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-// SECURITY: client-go pulls in golang.org/x/net and golang.org/x/text
-// transitively, and advisories in both are REACHABLE from this code via the
-// outbound HTTP calls (net/http -> http2) and text normalisation. We pin
-// patched minimums here (Go's MVS takes the highest requested version) and keep
-// them current as new advisories land; `govulncheck ./...` is the gate.
+// SECURITY: client-go pulls in golang.org/x/net transitively, and
+// golang.org/x/text is a direct dependency (internal/sanitize uses NFKC).
+// Advisories in both are REACHABLE from this code via the outbound HTTP calls
+// (net/http -> http2) and text normalisation. We pin patched minimums (Go's
+// MVS takes the highest requested version) and keep them current as new
+// advisories land; `govulncheck ./...` is the gate.
 //   golang.org/x/net  — HTTP/2 advisories (GO-2026-6603/6610/6611/6612/6617),
 //                       fixed in v0.60.0
 //   golang.org/x/text — infinite loop on invalid input (GO-2026-5970),
-//                       fixed in v0.39.0
-require (
-	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
-)
+//                       fixed in v0.39.0 (pinned above)
+require golang.org/x/net v0.60.0 // indirect

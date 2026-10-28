@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"kube-diagnose-agent/internal/sanitize"
 )
 
 //go:embed system_prompt.md
@@ -150,21 +152,59 @@ func userPrompt(bundle string) string {
 }
 
 // parseResultText extracts and unmarshals the final JSON object from model text.
+//
+// Every string field is normalised (sanitize.Normalize) BEFORE the read-only
+// filter runs and is stored in that form, so the text the filter inspected is
+// exactly the text the report prints. Filtering the raw string and normalising
+// at render time would let a zero-width character hide "exec" from the filter
+// and then vanish on screen.
 func parseResultText(text string) (*Result, error) {
 	jsonStr := extractJSON(text)
 	var out Result
 	if err := json.Unmarshal([]byte(jsonStr), &out); err != nil {
-		return nil, fmt.Errorf("parse model JSON: %w\nraw model output:\n%s", err, text)
+		return nil, fmt.Errorf("parse model JSON: %w\nraw model output (excerpt):\n%s", err, excerpt(text))
 	}
 	// A JSON object that parses but carries no summary is not an RCA — for
 	// example a stray object the model echoed from attacker-controlled logs.
 	// Rendering it would print an empty report that reads as "nothing found",
 	// which is the worst way for a diagnostic tool to fail. Fail loudly instead.
 	if strings.TrimSpace(out.Summary) == "" {
-		return nil, fmt.Errorf("model returned no usable RCA (empty summary)\nraw model output:\n%s", text)
+		return nil, fmt.Errorf("model returned no usable RCA (empty summary)\nraw model output (excerpt):\n%s", excerpt(text))
 	}
+	normalizeResult(&out)
 	enforceReadOnlySteps(&out)
+	flagRemediation(&out)
 	return &out, nil
+}
+
+// normalizeResult canonicalises every model-supplied string in place.
+func normalizeResult(r *Result) {
+	r.Summary = sanitize.Normalize(r.Summary)
+	r.Notes = sanitize.Normalize(r.Notes)
+	for i := range r.LikelyCauses {
+		c := &r.LikelyCauses[i]
+		c.Cause = sanitize.Normalize(c.Cause)
+		c.Confidence = sanitize.Normalize(c.Confidence)
+		for j := range c.Evidence {
+			c.Evidence[j] = sanitize.Normalize(c.Evidence[j])
+		}
+	}
+	for i := range r.RecommendedNextSteps {
+		r.RecommendedNextSteps[i] = sanitize.Normalize(r.RecommendedNextSteps[i])
+	}
+	for i := range r.SuggestedRemediation {
+		r.SuggestedRemediation[i] = sanitize.Normalize(r.SuggestedRemediation[i])
+	}
+}
+
+// maxErrorExcerpt bounds how much raw model output an error message carries.
+const maxErrorExcerpt = 2048
+
+// excerpt makes raw model output safe to print in an error: control
+// characters stripped (the error goes straight to the operator's terminal)
+// and the size bounded.
+func excerpt(text string) string {
+	return sanitize.Truncate(sanitize.Terminal(text), maxErrorExcerpt)
 }
 
 // extractJSON returns the last balanced top-level {...} object in s. The model's

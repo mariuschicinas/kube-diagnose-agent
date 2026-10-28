@@ -18,6 +18,7 @@ import (
 
 	"kube-diagnose-agent/internal/diagnose"
 	"kube-diagnose-agent/internal/llm"
+	"kube-diagnose-agent/internal/sanitize"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -36,7 +37,9 @@ func main() {
 	switch os.Args[1] {
 	case "diagnose":
 		if err := runDiagnose(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			// Errors can embed model output or API error bodies, both derived
+			// from attacker-influenceable text: sanitise before the terminal.
+			fmt.Fprintf(os.Stderr, "error: %s\n", sanitize.Terminal(err.Error()))
 			os.Exit(1)
 		}
 	case "-h", "--help", "help":
@@ -167,7 +170,9 @@ func runDiagnose(args []string) error {
 		AuditWriter:   auditWriter,
 	})
 	if showBundle {
-		fmt.Fprintf(os.Stderr, "--- redacted bundle sent to model ---\n%s\n--- end bundle ---\n", bundle)
+		// The bundle contains raw container logs. A log line carrying an ANSI
+		// escape (clear screen, OSC 52 clipboard write) must not run here.
+		fmt.Fprintf(os.Stderr, "--- redacted bundle sent to model ---\n%s\n--- end bundle ---\n", sanitize.Terminal(bundle))
 	}
 	if err != nil {
 		return err

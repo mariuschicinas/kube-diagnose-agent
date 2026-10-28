@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode"
 
 	"kube-diagnose-agent/internal/audit"
 	"kube-diagnose-agent/internal/collect"
 	"kube-diagnose-agent/internal/llm"
 	"kube-diagnose-agent/internal/redact"
+	"kube-diagnose-agent/internal/sanitize"
 	"kube-diagnose-agent/internal/tools"
 
 	"k8s.io/client-go/kubernetes"
@@ -123,40 +123,31 @@ func marshalResult(r *llm.Result) string {
 	return string(b)
 }
 
-// RenderJSON writes the result as indented JSON.
+// RenderJSON writes the result as indented JSON. HTML escaping is off: the
+// consumer is a pipeline, not a browser, and "<" for "<" only obscures
+// the evidence.
 func RenderJSON(w io.Writer, r *llm.Result) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
 	return enc.Encode(r)
 }
 
-// safe strips control characters (everything except \n and \t) from model
-// output before it reaches the operator's terminal. Model text is derived from
-// attacker-influenceable logs; an ANSI escape sequence smuggled through the
-// model must not be able to rewrite what the operator sees.
-func safe(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' {
-			return r
-		}
-		// Cc control chars (ANSI escapes, BEL, NUL, CR), line/paragraph
-		// separators, and Cf format chars — which include the bidi overrides
-		// (U+202A-202E, U+2066-2069) used in "trojan source" attacks to make
-		// text display differently from what it contains.
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, s)
+// block prepares one model-derived value for the terminal: control characters
+// stripped (sanitize.Terminal), and every embedded newline indented so the
+// value cannot start a line at column 0 and forge a report heading such as
+// "Next steps (read-only):" above a command of its own choosing.
+func block(s string) string {
+	return strings.ReplaceAll(sanitize.Terminal(s), "\n", "\n      ")
 }
 
 // RenderText writes a compact human-readable report. trace lists the tool calls
 // the agent made (may be empty). All model-derived strings are passed through
-// safe() first.
+// block() first.
 func RenderText(w io.Writer, ns, pod string, r *llm.Result, trace []string) {
 	fmt.Fprintf(w, "\nRCA for %s/%s\n", ns, pod)
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 60))
-	fmt.Fprintf(w, "Summary: %s\n", safe(r.Summary))
+	fmt.Fprintf(w, "Summary: %s\n", block(r.Summary))
 	if r.InsufficientEvidence {
 		fmt.Fprintln(w, "\n[!] Insufficient evidence — the steps below would disambiguate.")
 	}
@@ -164,31 +155,31 @@ func RenderText(w io.Writer, ns, pod string, r *llm.Result, trace []string) {
 	if len(r.LikelyCauses) > 0 {
 		fmt.Fprintln(w, "\nLikely causes:")
 		for i, c := range r.LikelyCauses {
-			fmt.Fprintf(w, "  %d. [%s] %s\n", i+1, safe(strings.ToUpper(c.Confidence)), safe(c.Cause))
+			fmt.Fprintf(w, "  %d. [%s] %s\n", i+1, block(strings.ToUpper(c.Confidence)), block(c.Cause))
 			for _, e := range c.Evidence {
-				fmt.Fprintf(w, "       - %s\n", safe(e))
+				fmt.Fprintf(w, "       - %s\n", block(e))
 			}
 		}
 	}
 	if len(r.RecommendedNextSteps) > 0 {
 		fmt.Fprintln(w, "\nNext steps (read-only):")
 		for _, s := range r.RecommendedNextSteps {
-			fmt.Fprintf(w, "  - %s\n", safe(s))
+			fmt.Fprintf(w, "  - %s\n", block(s))
 		}
 	}
 	if len(r.SuggestedRemediation) > 0 {
 		fmt.Fprintln(w, "\nSuggested remediation (review before applying):")
 		for _, s := range r.SuggestedRemediation {
-			fmt.Fprintf(w, "  - %s\n", safe(s))
+			fmt.Fprintf(w, "  - %s\n", block(s))
 		}
 	}
 	if strings.TrimSpace(r.Notes) != "" {
-		fmt.Fprintf(w, "\nNotes: %s\n", safe(r.Notes))
+		fmt.Fprintf(w, "\nNotes: %s\n", block(r.Notes))
 	}
 	if len(trace) > 0 {
 		fmt.Fprintln(w, "\nAgent investigated (read-only tool calls):")
 		for _, t := range trace {
-			fmt.Fprintf(w, "  - %s\n", safe(t))
+			fmt.Fprintf(w, "  - %s\n", block(t))
 		}
 	}
 }

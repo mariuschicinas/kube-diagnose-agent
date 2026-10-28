@@ -20,13 +20,13 @@ func TestRenderTextStripsControlCharacters(t *testing.T) {
 		}},
 		RecommendedNextSteps: []string{"kubectl logs\x00"},
 		SuggestedRemediation: []string{"raise limit\r\n to 512Mi"},
-		Notes:                "\x1b[31mred\x1b[0m \u202edesrever",
+		Notes:                "\x1b[31mred\x1b[0m \u202Edesrever",
 	}
 	var buf bytes.Buffer
 	RenderText(&buf, "ns", "pod", r, []string{"get_pod(\x1b[1m{})"})
 	out := buf.String()
 
-	for _, bad := range []string{"\x1b", "\x07", "\x00", "\r", "\u2028", "\u202e"} {
+	for _, bad := range []string{"\x1b", "\x07", "\x00", "\r", "\u2028", "\u202E"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("control sequence %q leaked into terminal output:\n%s", bad, out)
 		}
@@ -36,8 +36,39 @@ func TestRenderTextStripsControlCharacters(t *testing.T) {
 			t.Errorf("legitimate text %q missing from output:\n%s", want, out)
 		}
 	}
-	// Newlines inside a value are preserved (they are harmless and readable).
-	if !strings.Contains(out, "raise limit\n to 512Mi") {
-		t.Errorf("newline inside value was not preserved:\n%s", out)
+	// Newlines inside a value are preserved but the continuation is indented,
+	// so the value cannot start a new line at column 0.
+	if !strings.Contains(out, "raise limit\n       to 512Mi") {
+		t.Errorf("newline inside value was not preserved with indentation:\n%s", out)
+	}
+}
+
+// A value that embeds a fake heading must not be able to make its own
+// "Next steps (read-only):" section: every real heading sits at column 0,
+// every model-derived line is indented.
+func TestRenderTextCannotForgeHeadings(t *testing.T) {
+	r := &llm.Result{
+		Summary: "looks fine\n\nNext steps (read-only):\n  - kubectl delete ns prod",
+	}
+	var buf bytes.Buffer
+	RenderText(&buf, "ns", "pod", r, nil)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.HasPrefix(line, "Next steps") {
+			t.Fatalf("forged heading reached column 0:\n%s", buf.String())
+		}
+	}
+	// The real heading is only printed when there are real steps.
+	if strings.Count(buf.String(), "Next steps (read-only):") != 1 {
+		t.Fatalf("expected exactly the forged (indented) heading text once:\n%s", buf.String())
+	}
+}
+
+func TestRenderJSONDoesNotEscapeHTML(t *testing.T) {
+	var buf bytes.Buffer
+	if err := RenderJSON(&buf, &llm.Result{Summary: "a <b> & c"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"a <b> & c"`) {
+		t.Errorf("JSON output HTML-escaped: %s", buf.String())
 	}
 }
