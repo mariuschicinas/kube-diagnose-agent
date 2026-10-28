@@ -152,7 +152,10 @@ func (p *Provider) run(ctx context.Context, name string, input json.RawMessage) 
 	if err != nil {
 		return "", false, err
 	}
-	return redact.Scrub(raw), false, nil
+	// Tool results describe objects whose free-text fields (termination
+	// messages, condition messages, labels) another workload wrote. They are
+	// fenced like container logs so they cannot pose as trusted instructions.
+	return collect.FenceUntrusted(redact.Scrub(raw)), false, nil
 }
 
 func (p *Provider) getService(ctx context.Context, t target) (string, error) {
