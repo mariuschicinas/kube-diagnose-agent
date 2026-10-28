@@ -68,7 +68,8 @@ Usage:
 
 Flags:
   -n, --namespace       namespace of the pod (required)
-      --kubeconfig      path to kubeconfig (precedence: flag, in-cluster, $KUBECONFIG, ~/.kube/config)
+      --kubeconfig      DEVELOPMENT ONLY: path to a kubeconfig. Without it the agent must run
+                        in-cluster as the diagnose-agent ServiceAccount (deploy/job.yaml)
       --provider        LLM backend: anthropic | openai-compat (default: anthropic)
       --model           model name (default: `+llm.DefaultAnthropicModel+` for anthropic)
       --base-url        endpoint for openai-compat, e.g. http://localhost:11434/v1
@@ -113,7 +114,7 @@ func runDiagnose(args []string) error {
 
 	fs.StringVar(&ns, "n", "", "namespace")
 	fs.StringVar(&ns, "namespace", "", "namespace")
-	fs.StringVar(&kubeconfig, "kubeconfig", "", "path to kubeconfig")
+	fs.StringVar(&kubeconfig, "kubeconfig", "", "DEVELOPMENT ONLY: path to a kubeconfig (otherwise in-cluster)")
 	fs.StringVar(&provider, "provider", "anthropic", "LLM backend: anthropic | openai-compat")
 	fs.StringVar(&model, "model", "", "model name (defaults per provider)")
 	fs.StringVar(&baseURL, "base-url", "", "endpoint for openai-compat (e.g. http://localhost:11434/v1)")
@@ -233,22 +234,49 @@ func runDiagnose(args []string) error {
 	return nil
 }
 
-// newClientset resolves the cluster config in this order: an explicit
-// --kubeconfig flag, in-cluster config, $KUBECONFIG, ~/.kube/config. An explicit
-// flag always wins — it must never be silently overridden by the environment the
-// binary happens to run in.
+// newClientset resolves cluster access. The supported mode is in-cluster: the
+// agent runs as the diagnose-agent ServiceAccount (deploy/job.yaml), whose
+// RBAC is the read-only boundary. A kubeconfig is accepted only when named
+// explicitly with --kubeconfig, for development, and is announced as such:
+// the process then holds whatever rights that file carries — often
+// cluster-admin — and "read-only" is a property of this code, not of the
+// credentials. There is deliberately no silent fallback to ~/.kube/config.
 func newClientset(kubeconfig string) (kubernetes.Interface, error) {
 	if kubeconfig == "" {
-		if cfg, err := rest.InClusterConfig(); err == nil {
-			return kubernetes.NewForConfig(cfg)
+		cfg, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("not running in-cluster (%v) and no --kubeconfig given. "+
+				"The supported deployment is deploy/job.yaml (RBAC-bounded). "+
+				"For development pass --kubeconfig explicitly; RBAC does not bound a kubeconfig user", err)
 		}
-		if env := os.Getenv("KUBECONFIG"); env != "" {
-			kubeconfig = env
-		} else if home, _ := os.UserHomeDir(); home != "" {
-			kubeconfig = filepath.Join(home, ".kube", "config")
-		}
+		fmt.Fprintln(os.Stderr, "running in-cluster as the Pod's ServiceAccount (read-only enforced by RBAC)")
+		return kubernetes.NewForConfig(cfg)
 	}
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+
+	// A --kubeconfig value may be a single file or a PATH-style list, like
+	// $KUBECONFIG; the default loading rules merge a list.
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if strings.Contains(kubeconfig, string(filepath.ListSeparator)) {
+		rules.Precedence = filepath.SplitList(kubeconfig)
+	} else {
+		rules.ExplicitPath = kubeconfig
+	}
+	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	raw, err := cc.RawConfig()
+	if err != nil {
+		return nil, err
+	}
+	ctxName := raw.CurrentContext
+	userName, clusterName := "?", "?"
+	if c, ok := raw.Contexts[ctxName]; ok {
+		userName, clusterName = c.AuthInfo, c.Cluster
+	}
+	fmt.Fprintf(os.Stderr, "WARNING: using kubeconfig %s (context %q, cluster %q, user %q). "+
+		"Read-only is NOT enforced by RBAC in this mode: this process holds every right that user has. "+
+		"Use deploy/job.yaml for the supported, RBAC-bounded deployment.\n",
+		kubeconfig, ctxName, clusterName, userName)
+
+	cfg, err := cc.ClientConfig()
 	if err != nil {
 		return nil, err
 	}

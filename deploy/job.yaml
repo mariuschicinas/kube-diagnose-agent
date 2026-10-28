@@ -1,0 +1,70 @@
+# The supported way to run the agent: in-cluster, as the diagnose-agent
+# ServiceAccount. Only then is "read-only" an RBAC boundary — the process holds
+# the token bound by deploy/rbac*.yaml and nothing else. Run from a laptop with
+# --kubeconfig, the process holds whatever that file grants (often admin) and
+# read-only is merely a property of this code.
+#
+# One Job per diagnosis, started by an operator. Nothing here runs on its own.
+#
+# Prerequisites (once):
+#   kubectl apply -f deploy/rbac-namespaced.yaml     # or deploy/rbac.yaml
+#   kubectl -n diagnostics create secret generic diagnose-agent-llm \
+#     --from-literal=ANTHROPIC_API_KEY=sk-ant-...
+#   docker build -t <registry>/kube-diagnose-agent:<tag> . && docker push <registry>/kube-diagnose-agent:<tag>
+#   (then set .spec.template.spec.containers[0].image below, ideally by digest)
+#
+# Run one diagnosis (the placeholders are invalid names on purpose, so an
+# unedited copy fails loudly):
+#   sed 's/__NS__/demo/g; s/__POD__/crashloop/g' deploy/job.yaml | kubectl create -f -
+#   kubectl -n diagnostics logs -f job/diagnose-crashloop
+#
+# The report and the JSON-Lines audit record both go to stdout, so they land
+# in the cluster's log pipeline together. For a self-hosted model, replace the
+# env/args with --provider openai-compat --base-url ... (see README).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: diagnose-__POD__
+  namespace: diagnostics
+  labels:
+    app.kubernetes.io/name: diagnose-agent
+spec:
+  backoffLimit: 0 # a failed diagnosis is reported, not retried
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: diagnose-agent
+    spec:
+      serviceAccountName: diagnose-agent
+      automountServiceAccountToken: true # the token IS the credential
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/mariuschicinas/kube-diagnose-agent:latest # pin a digest in production
+          imagePullPolicy: IfNotPresent
+          args: ["diagnose", "-n", "__NS__", "__POD__", "--audit-log", "/dev/stdout"]
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: diagnose-agent-llm
+                  key: ANTHROPIC_API_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

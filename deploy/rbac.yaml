@@ -1,9 +1,15 @@
 # Read-only RBAC for the diagnose agent — CLUSTER-WIDE variant.
 #
-# The agent can only get/list/watch the resources it needs to build a
-# diagnostic bundle, and read pod logs. It has NO write/patch/delete/exec
-# permissions anywhere. Read-only is enforced at the RBAC layer, not just in
-# code — apply this and the worst a compromised agent can do is read.
+# The agent can only read the resources it needs to build a diagnostic bundle,
+# and read pod logs. It has NO write/patch/delete/exec permissions anywhere.
+# Read-only is enforced at the RBAC layer, not just in code — run the agent as
+# this ServiceAccount (deploy/job.yaml) and the worst a compromised agent can
+# do is read.
+#
+# Verbs are the minimum the code calls: the collector and the tools use Get on
+# pods and workloads, List on events and endpointslices, and nothing watches.
+# `list` on pods is deliberately NOT granted — it would let a token holder dump
+# every pod spec (with literal env: values) in one call.
 #
 # "Read" is still cluster-wide here: the ClusterRoleBinding lets this token read
 # Pods and logs in every namespace, kube-system included. The in-code namespace
@@ -14,10 +20,16 @@
 # Apply: kubectl apply -f deploy/rbac.yaml
 ---
 apiVersion: v1
+kind: Namespace
+metadata:
+  name: diagnostics
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: diagnose-agent
   namespace: diagnostics
+automountServiceAccountToken: false # mounted explicitly by deploy/job.yaml only
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -27,12 +39,15 @@ rules:
   - apiGroups: [""]
     resources:
       - pods
-      - events
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources:
       - pods/log
     verbs: ["get"]
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["list"]
   # Needed by the get_service / get_endpoints read-only tools (internal/tools).
   - apiGroups: [""]
     resources:
@@ -42,17 +57,18 @@ rules:
     resources:
       - endpointslices
     verbs: ["list"]
+  # Owner workload summary (internal/collect): one Get on the controller.
   - apiGroups: ["apps"]
     resources:
       - deployments
       - replicasets
       - statefulsets
       - daemonsets
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
   - apiGroups: ["batch"]
     resources:
       - jobs
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

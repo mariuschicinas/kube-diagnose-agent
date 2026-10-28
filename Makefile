@@ -1,13 +1,23 @@
-BINARY := agent
-PKG    := ./cmd/agent
-REPORT := security-report.md
+BINARY  := agent
+PKG     := ./cmd/agent
+REPORT  := security-report.md
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+IMG     ?= kube-diagnose-agent:$(VERSION)
 
-.PHONY: build tidy vendor run vet test clean tools scan vuln sbom report security
+# Development only: the supported deployment is deploy/job.yaml (in-cluster).
+KUBECONFIG ?= $(HOME)/.kube/config
+
+.PHONY: build image tidy vendor run vet test clean tools scan vuln sbom report security
 
 ## --- build ---
 
 build:
-	go build -o bin/$(BINARY) $(PKG)
+	go build -ldflags "-X main.agentVersion=$(VERSION)" -o bin/$(BINARY) $(PKG)
+
+# Distroless, non-root, built from the vendored tree. Push it and set the
+# image in deploy/job.yaml.
+image:
+	docker build --build-arg VERSION=$(VERSION) -t $(IMG) .
 
 tidy:
 	go mod tidy
@@ -24,8 +34,11 @@ test:
 	go test ./...
 
 # Example: make run NS=demo POD=crashloop
+# Runs with your kubeconfig — RBAC does NOT bound this; see deploy/job.yaml.
 run: build
-	./bin/$(BINARY) diagnose -n $(NS) $(POD)
+	@test -n "$(NS)" || { echo "NS is required: make run NS=<namespace> POD=<pod>"; exit 2; }
+	@test -n "$(POD)" || { echo "POD is required: make run NS=<namespace> POD=<pod>"; exit 2; }
+	./bin/$(BINARY) diagnose -n "$(NS)" "$(POD)" --kubeconfig "$(KUBECONFIG)"
 
 clean:
 	rm -rf bin $(REPORT) sbom.json
@@ -33,8 +46,9 @@ clean:
 ## --- security tooling ---
 
 # Install the scanners into $(go env GOPATH)/bin. Ensure that is on your PATH.
+# Both are pinned: the gate itself must be reproducible.
 tools:
-	go install golang.org/x/vuln/cmd/govulncheck@latest
+	go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 	go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
 
 # govulncheck: Go's official scanner. Does REACHABILITY analysis — it only
@@ -52,10 +66,11 @@ sbom:
 # it produced ~44 findings, none actionable. See section 3 of the report.
 scan: vuln
 
-# Generate the aggregated human-readable security report.
+# Generate the aggregated human-readable security report. Exits non-zero when
+# govulncheck found reachable vulnerabilities or could not run.
 report:
 	./hack/security-report.sh
 
-# One-shot: vendor, scan, SBOM, and write the report.
-security: vendor sbom report
+# One-shot: vendor, scan, SBOM, and write the report. Fails on findings.
+security: vendor scan sbom report
 	@echo "security pipeline complete -> $(REPORT)"

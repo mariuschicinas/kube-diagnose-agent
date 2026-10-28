@@ -35,14 +35,24 @@ could defend to a regulated financial-services security team. Two principles:
 
 1. **The LLM never touches the cluster.** It only ever sees a text bundle that
    *your* code assembled. All Kubernetes access is read-only client-go (get /
-   list / watch / pods/log) running under a ServiceAccount with no write verbs.
-   Read-only is an RBAC boundary, not a code convention. Two manifests ship:
+   list / pods/log). The supported way to run the agent is **in-cluster, as
+   the `diagnose-agent` ServiceAccount** ([`deploy/job.yaml`](deploy/job.yaml)),
+   whose role grants exactly the verbs the code calls and nothing else. Only
+   then is read-only an RBAC boundary rather than a code convention: a
+   compromised process holds a token that cannot write, exec or read Secrets.
+   Two RBAC manifests ship:
    [`deploy/rbac-namespaced.yaml`](deploy/rbac-namespaced.yaml) (recommended —
    one RoleBinding per namespace the agent may diagnose, so the token itself
    cannot read anywhere else) and [`deploy/rbac.yaml`](deploy/rbac.yaml)
    (cluster-wide read, for clusters where every namespace is in scope). CI
-   checks both for write verbs and for drift against the resources the code
-   actually reads.
+   parses both and fails on any verb outside get/list/watch, any wildcard, any
+   dangerous resource (`secrets`, `pods/exec`), and on drift against the
+   resources the code actually reads.
+
+   Running from a laptop with `--kubeconfig` is for development only, and the
+   agent says so at start-up: in that mode the process holds whatever rights
+   your kubeconfig user has, and read-only is enforced by this code alone.
+   There is no silent fallback to `~/.kube/config`.
 
 2. **Redaction is a fixed choke point.** Every section of the bundle passes
    through [`internal/redact`](internal/redact/redact.go) before it leaves the
@@ -90,25 +100,83 @@ could defend to a regulated financial-services security team. Two principles:
 
 For the target Pod: a describe-style summary (phase, conditions, per-container
 state + restart counts + **last-termination exit codes**, resources, probes),
-recent Events, current **and previous-instance** container logs (the previous
-instance is where CrashLoopBackOff hides), and a summary of the owning workload
-(Deployment / ReplicaSet / StatefulSet / DaemonSet / Job).
+recent Events (newest 50, with full timestamps), current **and
+previous-instance** logs of every container — init containers and native
+sidecars, app containers, ephemeral debug containers (the previous instance is
+where CrashLoopBackOff hides; the init container is where
+`Init:CrashLoopBackOff` hides) — each bounded by `--tail` lines and
+`--log-bytes` bytes, and a summary of the owning workload (Deployment /
+ReplicaSet / StatefulSet / DaemonSet / Job). Free-text fields written by the
+application (termination messages, condition messages, event text) are
+bounded and neutralised like log lines.
 
 ## Setup
 
-Requires Go 1.26+ (the version pinned in `go.mod`; `go` downloads it automatically
-if your local toolchain is older) and an Anthropic API key.
+### In-cluster (supported)
+
+The agent runs as a one-off Job under the `diagnose-agent` ServiceAccount.
+An operator starts it; nothing runs on its own.
 
 ```bash
-go mod tidy            # populate the dependency graph
-make build             # -> bin/agent
-export ANTHROPIC_API_KEY=sk-ant-...
-./bin/agent diagnose -n prod api-7d9f-abc
+# 1. RBAC: pick ONE of the two manifests (see "Why it's built this way").
+kubectl apply -f deploy/rbac-namespaced.yaml   # edit the RoleBinding namespace first
+
+# 2. LLM credential, in the agent's namespace.
+kubectl -n diagnostics create secret generic diagnose-agent-llm \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-...
+
+# 3. Image. Distroless, non-root, built from the committed vendor/ tree.
+make image IMG=<registry>/kube-diagnose-agent:<tag> && docker push <registry>/kube-diagnose-agent:<tag>
+#    then set .spec.template.spec.containers[0].image in deploy/job.yaml (by digest in production)
+
+# 4. One diagnosis = one Job.
+sed 's/__NS__/prod/g; s/__POD__/api-7d9f-abc/g' deploy/job.yaml | kubectl create -f -
+kubectl -n diagnostics logs -f job/diagnose-api-7d9f-abc
 ```
 
-Flags: `--json`, `--show-bundle`, `--model`, `--tail`, `--max-tokens`,
-`--kubeconfig`. The client prefers in-cluster config, then `$KUBECONFIG`, then
-`~/.kube/config`.
+The report and the JSON-Lines audit record are both written to the Job's
+stdout, so they land in the cluster's log pipeline together. Confirm the
+boundary yourself at any time:
+
+```bash
+kubectl auth can-i delete pods --as=system:serviceaccount:diagnostics:diagnose-agent -n prod   # no
+kubectl auth can-i get secrets --as=system:serviceaccount:diagnostics:diagnose-agent -n prod   # no
+```
+
+### On a laptop (development only)
+
+Requires Go 1.26+ (the version pinned in `go.mod`; `go` downloads it
+automatically if your local toolchain is older). The vendored dependencies
+are committed, so no `go mod tidy` is needed.
+
+```bash
+make build                       # -> bin/agent
+export ANTHROPIC_API_KEY=sk-ant-...
+./bin/agent diagnose -n demo crashloop --kubeconfig ~/.kube/config
+```
+
+`--kubeconfig` must be explicit, and the agent prints a warning naming the
+context and user: in this mode RBAC does not bound the process. `make run
+NS=demo POD=crashloop` does the same.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-n`, `--namespace` | — | namespace of the Pod (required) |
+| `--kubeconfig` | — | development only; otherwise in-cluster |
+| `--provider` | `anthropic` | `anthropic` or `openai-compat` |
+| `--model` | per provider | model name |
+| `--base-url` | — | endpoint for `openai-compat` |
+| `--api-key-env` | `ANTHROPIC_API_KEY` | env var holding the API key; may be unset for local backends |
+| `--tail` | 200 | log lines per container instance (max 10000) |
+| `--log-bytes` | 65536 | bytes per container instance log |
+| `--max-tokens` | 2048 | model output budget |
+| `--max-iterations` | 4 | read-only tool rounds; `0` = single-shot, no tools |
+| `--json` | off | emit `{"result": …, "tool_trace": […]}` |
+| `--show-bundle` | off | print the redacted bundle that was sent (sanitised for the terminal) |
+| `--audit-log` | — | append one JSON-Lines audit record per run to this file |
+| `--audit-required` | off | fail the run if the audit record cannot be written |
 
 ## LLM backends
 
@@ -161,9 +229,10 @@ log. Claude, on the same bundle, ignored the payload and made no tool calls.
   by selector; dependency-Pod logs — each added only when a failure mode needs
   it.
 - **done — audit trail and self-hosted inference.** Every run can write a
-  structured JSON audit record (`--audit-log`): model, prompt and bundle
-  digests, every tool call, and refusals. The `openai-compat` backend has been
-  run end to end against vLLM.
+  structured JSON audit record (`--audit-log`): resolved model and endpoint,
+  prompt and bundle digests, every tool call, refusals, and the outcome — on
+  failed runs too. The `openai-compat` backend has been run end to end
+  against vLLM.
 
 ## How this was built
 
