@@ -73,8 +73,8 @@ func TestAnthropicForcedRoundKeepsToolsWithToolChoiceNone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Summary != "db down" || len(trace) != 1 || ft.runs != 1 {
-		t.Fatalf("unexpected result: %+v trace=%v runs=%d", res, trace, ft.runs)
+	if res.Summary != "db down" || len(trace) != 1 || ft.runs() != 1 {
+		t.Fatalf("unexpected result: %+v trace=%v runs=%d", res, trace, ft.runs())
 	}
 	if len(s.reqs) != 2 {
 		t.Fatalf("want 2 requests, got %d", len(s.reqs))
@@ -111,8 +111,8 @@ func TestAnthropicPerRoundToolBudget(t *testing.T) {
 	if _, _, err := p.Diagnose(context.Background(), "bundle", ft); err != nil {
 		t.Fatal(err)
 	}
-	if ft.runs != maxToolCallsPerRound {
-		t.Fatalf("executed %d tool calls, want %d", ft.runs, maxToolCallsPerRound)
+	if ft.runs() != maxToolCallsPerRound {
+		t.Fatalf("executed %d tool calls, want %d", ft.runs(), maxToolCallsPerRound)
 	}
 	results := s.reqs[1].Messages[2].Content
 	if len(results) != maxToolCallsPerRound+2 {
