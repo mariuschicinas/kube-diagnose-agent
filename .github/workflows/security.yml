@@ -21,15 +21,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26"
-          check-latest: true
+          # The exact toolchain pinned in go.mod: CI must build and scan what
+          # is shipped, not whichever patch release is newest today.
+          go-version-file: go.mod
 
       # Fails if any module does not match its go.sum hash.
       - name: Verify module checksums
         run: go mod verify
+
+      # vendor/ is what gets built (-mod=vendor). An edit to a vendored file
+      # would be built and tested as-is and never seen by govulncheck, which
+      # reads module versions. Regenerating the tree must be a no-op.
+      - name: Vendor tree matches go.mod / go.sum
+        run: |
+          go mod vendor
+          git diff --exit-code -- vendor go.mod go.sum
 
       - name: Build
         run: go build ./...
@@ -45,7 +56,7 @@ jobs:
       - name: govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
-          go-version-input: "1.26"
+          go-version-file: go.mod
           repo-checkout: false
 
       - name: Generate SBOM (CycloneDX)
@@ -64,22 +75,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # These greps are cheap regression tests for the security architecture.
-      # They are here so that a future refactor cannot silently remove a control.
-      - name: RBAC must contain no write verbs
+      # These checks are cheap regression tests for the security architecture.
+      # They are here so that a future refactor cannot silently remove a
+      # control. The behavioural guarantees themselves are covered by Go tests
+      # (internal/tools, internal/llm, internal/redact); the greps below only
+      # catch a control being deleted outright.
+
+      # RBAC is parsed, not grepped: a block-style `verbs:` list, a wildcard,
+      # or a dangerous resource (secrets, pods/exec) must fail however the
+      # YAML is laid out. yq is preinstalled on ubuntu-latest.
+      - name: RBAC must grant only get/list/watch on safe resources
         run: |
-          # Inspect only the verbs: lines — not comments, which legitimately
-          # mention write verbs when explaining their absence.
+          set -euo pipefail
           for f in deploy/rbac.yaml deploy/rbac-namespaced.yaml; do
-            if grep -E '^\s*verbs:' "$f" \
-               | grep -Eq '(create|update|patch|delete|deletecollection|impersonate|escalate|bind)'; then
-              echo "::error::$f grants a write verb — the agent must stay read-only"
-              grep -nE '^\s*verbs:' "$f"
+            roles='select(.kind == "ClusterRole" or .kind == "Role")'
+            bad_verbs=$(yq -r "$roles | .rules[] | .verbs[]" "$f" | grep -Evx 'get|list|watch' || true)
+            if [ -n "$bad_verbs" ]; then
+              echo "::error::$f grants non-read verbs: $bad_verbs — the agent must stay read-only"
+              exit 1
+            fi
+            bad_res=$(yq -r "$roles | .rules[] | .resources[]" "$f" \
+              | grep -Eix 'secrets|\*|.*/exec|.*/attach|.*/portforward|.*/proxy|serviceaccounts/token' || true)
+            if [ -n "$bad_res" ]; then
+              echo "::error::$f grants a dangerous resource: $bad_res"
+              exit 1
+            fi
+            if yq -r "$roles | .rules[] | .apiGroups[]" "$f" | grep -qx '\*'; then
+              echo "::error::$f uses a wildcard apiGroup"
+              exit 1
+            fi
+            # Every binding must point at the read-only role, nothing else.
+            other=$(yq -r 'select(.kind | test("Binding$")) | .roleRef.name' "$f" | grep -vx 'diagnose-agent-readonly' || true)
+            if [ -n "$other" ]; then
+              echo "::error::$f binds the ServiceAccount to another role: $other"
               exit 1
             fi
           done
-          echo "OK: RBAC grants only read verbs"
+          echo "OK: RBAC grants only read verbs on safe resources"
 
       - name: RBAC must cover every resource the tools read
         run: |
@@ -87,8 +122,7 @@ jobs:
           # that the ServiceAccount cannot actually use fails with 403 at
           # runtime; this catches the manifest drifting from the code.
           # Limitation: the resource list below is maintained by hand. When a
-          # tool starts reading a new resource, add it here too. The check also
-          # does not verify apiGroup or verb — review those in the manifest.
+          # tool starts reading a new resource, add it here too.
           for f in deploy/rbac.yaml deploy/rbac-namespaced.yaml; do
             for res in pods events pods/log services endpointslices deployments replicasets statefulsets daemonsets jobs; do
               grep -Eq "^\s*- ${res}\s*$" "$f" || {
@@ -99,9 +133,20 @@ jobs:
           done
           echo "OK: RBAC covers every resource the agent reads"
 
+      - name: The Job must run as the read-only ServiceAccount, unprivileged
+        run: |
+          set -euo pipefail
+          f=deploy/job.yaml
+          [ "$(yq -r '.spec.template.spec.serviceAccountName' $f)" = "diagnose-agent" ] || { echo "::error::$f does not run as diagnose-agent"; exit 1; }
+          [ "$(yq -r '.spec.template.spec.securityContext.runAsNonRoot' $f)" = "true" ] || { echo "::error::$f does not set runAsNonRoot"; exit 1; }
+          [ "$(yq -r '.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation' $f)" = "false" ] || { echo "::error::$f allows privilege escalation"; exit 1; }
+          [ "$(yq -r '.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem' $f)" = "true" ] || { echo "::error::$f has a writable root filesystem"; exit 1; }
+          yq -r '.spec.template.spec.containers[0].securityContext.capabilities.drop[]' $f | grep -qx ALL || { echo "::error::$f does not drop all capabilities"; exit 1; }
+          echo "OK: Job runs as diagnose-agent, non-root, no capabilities"
+
       - name: Namespace allowlist must be enforced in tools
         run: |
-          grep -q 'allowedNS' internal/tools/tools.go || {
+          grep -rq 'allowedNS' internal/tools/*.go || {
             echo "::error::namespace allowlist missing from internal/tools — cross-namespace reads would be possible"
             exit 1
           }
@@ -109,26 +154,29 @@ jobs:
 
       - name: No exec/attach/portforward tool may exist
         run: |
-          if grep -Eq '"(exec|attach|portforward)"' internal/tools/tools.go; then
+          # A tool exists when it is advertised (Name: "...") or dispatched
+          # (case "..."); the probe kind string "exec" in internal/collect is
+          # neither.
+          if grep -rEq '(Name:\s*|case\s*)"(exec|attach|portforward|port-forward|debug|run)"' --include='*.go' --exclude='*_test.go' cmd internal; then
             echo "::error::an exec-class tool was added — this breaks the read-only guarantee"
+            grep -rnE '(Name:\s*|case\s*)"(exec|attach|portforward|port-forward|debug|run)"' --include='*.go' cmd internal
             exit 1
           fi
           echo "OK: no exec-class tools"
 
-      - name: No tool may read Secret contents
+      - name: No code may read Secret contents
         run: |
-          # The tool surface is the blast radius. A tool that returns Secret
+          # The tool surface is the blast radius. Code that returns Secret
           # .Data into the model's context is an exfiltration path that no
           # namespace allowlist can close (the attacker just targets the
           # allowed namespace). Reading a Secret's .Data or .StringData is
-          # therefore forbidden outright. Existence/metadata checks are fine.
-          if grep -Eq '\.(Data|StringData)\b' internal/tools/tools.go \
-             || grep -Eiq 'Secrets\([^)]*\)\.Get' internal/tools/tools.go; then
-            echo "::error::a tool reads Secret contents — secret material must never enter the model context"
-            grep -nE '\.(Data|StringData)\b|Secrets\([^)]*\)\.Get' internal/tools/tools.go
+          # therefore forbidden outright, anywhere in the agent.
+          if grep -rEiq 'Secrets\([^)]*\)\.(Get|List)' --include='*.go' --exclude='*_test.go' cmd internal; then
+            echo "::error::code reads Secrets — secret material must never enter the model context"
+            grep -rniE 'Secrets\([^)]*\)\.(Get|List)' --include='*.go' cmd internal
             exit 1
           fi
-          echo "OK: no tool reads Secret contents"
+          echo "OK: no code reads Secrets"
 
       - name: Next steps must be filtered to read-only commands
         run: |
@@ -147,8 +195,23 @@ jobs:
             echo "::error::bundle is not scrubbed before egress"
             exit 1
           }
+          grep -q 'redact.Scrub' internal/collect/collect.go || {
+            echo "::error::bundle sections are not scrubbed before assembly"
+            exit 1
+          }
           grep -q 'redact.Scrub' internal/tools/tools.go || {
             echo "::error::tool results are not scrubbed before returning to the model"
             exit 1
           }
-          echo "OK: redaction applied to both bundle and tool results"
+          echo "OK: redaction applied to bundle sections, bundle and tool results"
+
+      - name: No kubeconfig fallback may exist
+        run: |
+          # The supported mode is in-cluster. A silent fallback to
+          # ~/.kube/config would re-introduce running with the operator's
+          # (admin) credentials without a warning.
+          if grep -rEq 'UserHomeDir|Getenv\("KUBECONFIG"\)|RecommendedHomeFile|RecommendedConfigPathEnvVar' --include='*.go' --exclude='*_test.go' cmd; then
+            echo "::error::cmd/agent resolves a kubeconfig from the environment without --kubeconfig"
+            exit 1
+          fi
+          echo "OK: no implicit kubeconfig fallback"

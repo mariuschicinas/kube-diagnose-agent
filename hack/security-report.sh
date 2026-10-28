@@ -39,8 +39,10 @@ echo "==> generating $REPORT"
   MAIN=$(go list -mod=mod -m 2>/dev/null | head -1)
   # {{.Version}} is empty for the main module, so filtering on a version field
   # also drops it; filter by path too for safety.
-  DIRECT=$(go list -mod=mod -m -f '{{if and (not .Indirect) .Version}}{{.Path}} {{.Version}}{{end}}' all 2>/dev/null | grep -v "^${MAIN} " | grep -cv '^$' || echo 0)
-  TOTAL=$(go list -mod=mod -m all 2>/dev/null | grep -cv '^$' || echo 0)
+  # grep -c prints its count (0 included) even when it exits 1, so a
+  # fallback echo would print a second number.
+  DIRECT=$(go list -mod=mod -m -f '{{if and (not .Indirect) .Version}}{{.Path}} {{.Version}}{{end}}' all 2>/dev/null | grep -v "^${MAIN} " | grep -cv '^$' || true)
+  TOTAL=$(go list -mod=mod -m all 2>/dev/null | grep -cv '^$' || true)
   echo "- Direct modules: **${DIRECT}**"
   echo "- Total modules in graph (incl. transitive): **${TOTAL}**"
   echo
@@ -166,13 +168,13 @@ go mod verify >> "$REPORT" 2>&1 || echo "(verify failed — investigate)" >> "$R
   echo
   echo "| Control | Mechanism | Enforced by |"
   echo "|---|---|---|"
-  echo "| No write access to the cluster | ServiceAccount has no write verbs | **RBAC** (\`deploy/rbac.yaml\`) |"
+  echo "| No write access to the cluster | Runs in-cluster as a ServiceAccount with get/list only (deploy/job.yaml); a kubeconfig is accepted only with an explicit flag and a warning | **RBAC** (\`deploy/rbac*.yaml\`) |"
   echo "| No cross-namespace reads | Tool calls outside the target namespace are refused before any API call | **Code** (\`internal/tools\`) |"
   echo "| No arbitrary command execution | 3 typed, scoped read tools; no exec/shell tool exists | **Code** (tool surface) |"
   echo "| Secrets are masked before egress (best-effort) | Every section is scrubbed for known credential shapes before it leaves the process; unrecognisable high-entropy secrets can still pass | **Code** (\`internal/redact\`) |"
   echo "| Logs cannot issue instructions | Untrusted fence + neutralized control syntax + system-prompt trust boundary | **Prompt + code** (probabilistic) |"
-  echo "| Bounded investigation | Hard cap on tool-call rounds | **Code** (\`--max-iterations\`) |"
-  echo "| Auditability | Every tool call traced; refusals raised as SECURITY warnings | **Code** (\`internal/diagnose\`) |"
+  echo "| Bounded investigation | Hard cap on tool-call rounds, calls per round, log bytes per container, response bytes | **Code** (\`--max-iterations\`, \`--log-bytes\`) |"
+  echo "| Auditability | Every tool call traced; refusals raised as SECURITY warnings; one JSON-Lines record per run with model, endpoint, prompt/bundle digests and outcome (\`--audit-log\`) | **Code** (\`internal/audit\`) |"
   echo
   echo "Verify egress yourself at any time:"
   echo
@@ -199,3 +201,8 @@ elif [ "$VULN_RC" -eq 2 ]; then
 else
   echo "  govulncheck: REACHABLE VULNERABILITIES — see $REPORT section 2"
 fi
+
+# The report is written either way (it documents the failure), but the script
+# must not exit 0 when the gate did not pass: a release script that runs
+# `make security` has to stop here.
+exit "$VULN_RC"

@@ -12,6 +12,9 @@
 # RoleBinding. The token can then only read the namespaces listed here. Add one
 # RoleBinding per namespace the agent is allowed to diagnose.
 #
+# Verbs are the minimum the code calls (Get on pods and workloads, List on
+# events and endpointslices, nothing watches); see deploy/rbac.yaml.
+#
 # Apply: kubectl apply -f deploy/rbac-namespaced.yaml
 #
 # Do NOT also apply deploy/rbac.yaml: its ClusterRoleBinding would re-widen the
@@ -27,6 +30,7 @@ kind: ServiceAccount
 metadata:
   name: diagnose-agent
   namespace: diagnostics
+automountServiceAccountToken: false # mounted explicitly by deploy/job.yaml only
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -36,12 +40,15 @@ rules:
   - apiGroups: [""]
     resources:
       - pods
-      - events
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources:
       - pods/log
     verbs: ["get"]
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["list"]
   # Needed by the get_service / get_endpoints read-only tools (internal/tools).
   - apiGroups: [""]
     resources:
@@ -51,21 +58,27 @@ rules:
     resources:
       - endpointslices
     verbs: ["list"]
+  # Owner workload summary (internal/collect): one Get on the controller.
   - apiGroups: ["apps"]
     resources:
       - deployments
       - replicasets
       - statefulsets
       - daemonsets
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
   - apiGroups: ["batch"]
     resources:
       - jobs
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
 ---
 # One RoleBinding per namespace the agent may diagnose. The roleRef points at
 # the ClusterRole above; because the binding is a RoleBinding, the permissions
 # apply only inside metadata.namespace. Copy this block for each namespace.
+#
+# The target namespace must already exist: `demo` below is the namespace used
+# by hack/broken-pods.yaml. Change it to yours — applying this file unchanged
+# on a cluster without `demo` fails on this object, which is the intended
+# outcome for an unreviewed copy.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

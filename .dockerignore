@@ -1,0 +1,11 @@
+.git
+.github
+bin
+deploy
+hack
+*.md
+security-report.md
+sbom.json
+.env
+kubeconfig
+*.log
