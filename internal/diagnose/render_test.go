@@ -63,12 +63,22 @@ func TestRenderTextCannotForgeHeadings(t *testing.T) {
 	}
 }
 
-func TestRenderJSONDoesNotEscapeHTML(t *testing.T) {
+func TestRenderJSONDoesNotEscapeHTMLAndCarriesTrace(t *testing.T) {
 	var buf bytes.Buffer
-	if err := RenderJSON(&buf, &llm.Result{Summary: "a <b> & c"}); err != nil {
+	if err := RenderJSON(&buf, &llm.Result{Summary: "a <b> & c"}, []string{"get_pod({})"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), `"a <b> & c"`) {
-		t.Errorf("JSON output HTML-escaped: %s", buf.String())
+	out := buf.String()
+	if !strings.Contains(out, `"a <b> & c"`) {
+		t.Errorf("JSON output HTML-escaped: %s", out)
+	}
+	if !strings.Contains(out, `"tool_trace": [`) || !strings.Contains(out, `"get_pod({})"`) {
+		t.Errorf("tool trace missing from JSON output: %s", out)
+	}
+	// A nil trace must render as [] not null, for pipeline consumers.
+	buf.Reset()
+	_ = RenderJSON(&buf, &llm.Result{Summary: "x"}, nil)
+	if !strings.Contains(buf.String(), `"tool_trace": []`) {
+		t.Errorf("nil trace not rendered as []: %s", buf.String())
 	}
 }

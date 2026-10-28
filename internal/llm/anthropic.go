@@ -20,6 +20,7 @@ const (
 // to keep the dependency surface small.
 type anthropicProvider struct {
 	httpc     *http.Client
+	url       string // anthropicURL; a field so tests can point it at httptest
 	apiKey    string
 	model     string
 	maxTokens int
@@ -44,7 +45,8 @@ func newAnthropic(c Config) (Provider, error) {
 		maxTokens = 2048
 	}
 	return &anthropicProvider{
-		httpc:     &http.Client{Timeout: defaultTimeout},
+		httpc:     &http.Client{Timeout: CallTimeout},
+		url:       anthropicURL,
 		apiKey:    key,
 		model:     model,
 		maxTokens: maxTokens,
@@ -52,14 +54,23 @@ func newAnthropic(c Config) (Provider, error) {
 	}, nil
 }
 
+func (p *anthropicProvider) Info() ProviderInfo {
+	return ProviderInfo{Kind: "anthropic", Model: p.model, Endpoint: redactURL(p.url)}
+}
+
 // --- wire types ---
 
 type anthReq struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system"`
-	Tools     []ToolDef `json:"tools,omitempty"`
-	Messages  []anthMsg `json:"messages"`
+	Model      string          `json:"model"`
+	MaxTokens  int             `json:"max_tokens"`
+	System     string          `json:"system"`
+	Tools      []ToolDef       `json:"tools,omitempty"`
+	ToolChoice *anthToolChoice `json:"tool_choice,omitempty"`
+	Messages   []anthMsg       `json:"messages"`
+}
+
+type anthToolChoice struct {
+	Type string `json:"type"` // "auto" | "any" | "tool" | "none"
 }
 
 type anthMsg struct {
@@ -104,6 +115,7 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 	}
 
 	var trace []string
+	totalCalls := 0
 	for round := 0; ; round++ {
 		// Hard cap: maxIter tool rounds plus one forced-conclusion round. With
 		// the offered-tools check below this cannot normally trigger; it stays as
@@ -119,13 +131,23 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 			System:    systemFor(offerTools),
 			Messages:  messages,
 		}
-		if offerTools {
+		// The API requires `tools` on every request whose history contains
+		// tool_use/tool_result blocks, so the definitions are always sent once
+		// a tool provider exists. On the forced-conclusion round tool_choice
+		// "none" withdraws them: the model must answer with text.
+		if tp != nil {
 			req.Tools = tools
+			if !offerTools {
+				req.ToolChoice = &anthToolChoice{Type: "none"}
+			}
 		}
 
 		resp, err := p.call(ctx, req)
 		if err != nil {
 			return nil, trace, err
+		}
+		if resp.StopReason == "max_tokens" {
+			return nil, trace, fmt.Errorf("model output was cut off at %d tokens (stop_reason=max_tokens); raise --max-tokens", p.maxTokens)
 		}
 		messages = append(messages, anthMsg{Role: "assistant", Content: resp.Content})
 
@@ -147,17 +169,23 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 		}
 
 		// Tools are executed only in rounds where they were offered. A backend
-		// that returns tool calls anyway (weaker openai-compat models do) is an
-		// error, not something to act on — and with --max-iterations 0 there is
-		// no tool provider at all, so calling it would panic.
+		// that returns tool calls anyway is an error, not something to act on —
+		// and with --max-iterations 0 there is no tool provider at all, so
+		// calling it would panic.
 		if !offerTools || tp == nil {
 			return nil, trace, fmt.Errorf("model requested tools in round %d, where none were offered", round)
 		}
 
 		var results []anthBlock
-		for _, tu := range toolUses {
-			trace = append(trace, fmt.Sprintf("%s(%s)", tu.Name, string(tu.Input)))
+		for i, tu := range toolUses {
 			block := anthBlock{Type: "tool_result", ToolUseID: tu.ID}
+			if why := overBudget(i, totalCalls, p.maxIter); why != "" {
+				block.Content, block.IsError = "tool error: "+why, true
+				results = append(results, block)
+				continue
+			}
+			totalCalls++
+			trace = append(trace, fmt.Sprintf("%s(%s)", tu.Name, string(tu.Input)))
 			out, rerr := tp.Run(ctx, tu.Name, tu.Input)
 			if rerr != nil {
 				block.Content = "tool error: " + rerr.Error()
@@ -171,20 +199,33 @@ func (p *anthropicProvider) Diagnose(ctx context.Context, bundle string, tp Tool
 	}
 }
 
+// overBudget returns a reason when the i-th call of a round, after totalCalls
+// already made, exceeds the per-round or total tool budget; "" otherwise.
+func overBudget(i, totalCalls, maxIter int) string {
+	if i >= maxToolCallsPerRound {
+		return fmt.Sprintf("at most %d tool calls per round; this call was not executed", maxToolCallsPerRound)
+	}
+	if totalCalls >= maxIter*maxToolCallsPerRound {
+		return "total tool budget for this run is exhausted; conclude with the evidence you have"
+	}
+	return ""
+}
+
 func (p *anthropicProvider) call(ctx context.Context, req anthReq) (*anthResp, error) {
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("x-api-key", p.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
-
-	resp, err := p.httpc.Do(httpReq)
+	resp, err := doWithRetry(ctx, p.httpc, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("content-type", "application/json")
+		httpReq.Header.Set("x-api-key", p.apiKey)
+		httpReq.Header.Set("anthropic-version", anthropicVersion)
+		return httpReq, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("call anthropic api: %w", err)
 	}

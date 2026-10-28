@@ -28,6 +28,7 @@ import (
 type openAICompatProvider struct {
 	httpc     *http.Client
 	baseURL   string
+	display   string // baseURL with credentials/query stripped, for errors and audit
 	apiKey    string // may be empty (local Ollama / in-VPC vLLM often need no auth)
 	model     string
 	maxTokens int
@@ -49,26 +50,39 @@ func newOpenAICompat(c Config) (Provider, error) {
 		maxTokens = 2048
 	}
 	// An API key is optional: a local or in-VPC endpoint typically has none.
+	// But an --api-key-env that names an unset variable is a typo, not a
+	// choice: fail now rather than send an unauthenticated request.
 	var key string
 	if c.APIKeyEnv != "" {
 		key = os.Getenv(c.APIKeyEnv)
-	}
-	// A bearer token over plaintext HTTP to a non-local host leaks the key to
-	// anyone on the path. Warn loudly; do not block (in-VPC http is a valid
-	// operator choice).
-	if key != "" {
-		if u, perr := url.Parse(base); perr == nil && u.Scheme == "http" && !isLocalHost(u.Hostname()) {
-			fmt.Fprintf(os.Stderr, "WARNING: --base-url %s uses plaintext http with an API key; the key is sent unencrypted\n", base)
+		if key == "" {
+			return nil, fmt.Errorf("--api-key-env %s is set but the variable is empty", c.APIKeyEnv)
 		}
 	}
+	display := redactURL(base)
+	// Plaintext HTTP to a non-local host sends the redacted bundle — and the
+	// key, if any — to anyone on the path. Warn loudly; do not block (in-VPC
+	// http is a valid operator choice).
+	if u, perr := url.Parse(base); perr == nil && u.Scheme == "http" && !isLocalHost(u.Hostname()) {
+		what := "the redacted bundle is sent unencrypted"
+		if key != "" {
+			what = "the API key and the redacted bundle are sent unencrypted"
+		}
+		fmt.Fprintf(os.Stderr, "WARNING: --base-url %s uses plaintext http to a non-local host; %s\n", display, what)
+	}
 	return &openAICompatProvider{
-		httpc:     &http.Client{Timeout: defaultTimeout},
+		httpc:     &http.Client{Timeout: CallTimeout},
 		baseURL:   base,
+		display:   display,
 		apiKey:    key,
 		model:     model,
 		maxTokens: maxTokens,
 		maxIter:   c.MaxIterations,
 	}, nil
+}
+
+func (p *openAICompatProvider) Info() ProviderInfo {
+	return ProviderInfo{Kind: "openai-compat", Model: p.model, Endpoint: p.display + "/chat/completions"}
 }
 
 // isLocalHost reports whether host is loopback or a private (RFC 1918 / ULA)
@@ -167,6 +181,7 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 	}
 
 	var trace []string
+	totalCalls := 0
 	for round := 0; ; round++ {
 		// Hard cap: maxIter tool rounds plus one forced-conclusion round. With
 		// the offered-tools check below this cannot normally trigger; it stays as
@@ -193,7 +208,11 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 		if len(resp.Choices) == 0 {
 			return nil, trace, fmt.Errorf("backend returned no choices")
 		}
-		msg := resp.Choices[0].Message
+		choice := resp.Choices[0]
+		if choice.FinishReason == "length" {
+			return nil, trace, fmt.Errorf("model output was cut off at %d tokens (finish_reason=length); raise --max-tokens", p.maxTokens)
+		}
+		msg := choice.Message
 
 		if len(msg.ToolCalls) == 0 {
 			res, err := parseResultText(msg.Content)
@@ -216,17 +235,23 @@ func (p *openAICompatProvider) Diagnose(ctx context.Context, bundle string, tp T
 			ToolCls: msg.ToolCalls,
 		})
 
-		for _, tc := range msg.ToolCalls {
-			args := json.RawMessage(tc.Function.Arguments)
-			trace = append(trace, fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments))
-
-			content, rerr := tp.Run(ctx, tc.Function.Name, args)
-			if rerr != nil {
-				// Smaller models fabricate tool names and malformed arguments far
-				// more often than frontier models. Feeding the error back lets the
-				// model correct itself; the namespace allowlist has already refused
-				// anything out of scope regardless.
-				content = "tool error: " + rerr.Error()
+		for i, tc := range msg.ToolCalls {
+			var content string
+			if why := overBudget(i, totalCalls, p.maxIter); why != "" {
+				content = "tool error: " + why
+			} else {
+				totalCalls++
+				args := json.RawMessage(tc.Function.Arguments)
+				trace = append(trace, fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments))
+				out, rerr := tp.Run(ctx, tc.Function.Name, args)
+				if rerr != nil {
+					// Smaller models fabricate tool names and malformed arguments far
+					// more often than frontier models. Feeding the error back lets the
+					// model correct itself; the namespace allowlist has already refused
+					// anything out of scope regardless.
+					out = "tool error: " + rerr.Error()
+				}
+				content = out
 			}
 			messages = append(messages, oaiMsg{
 				Role:       "tool",
@@ -242,25 +267,27 @@ func (p *openAICompatProvider) call(ctx context.Context, req oaiReq) (*oaiResp, 
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	url := p.baseURL + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	endpoint := p.baseURL + "/chat/completions"
+	resp, err := doWithRetry(ctx, p.httpc, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("content-type", "application/json")
+		if p.apiKey != "" {
+			httpReq.Header.Set("authorization", "Bearer "+p.apiKey)
+		}
+		return httpReq, nil
+	})
 	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("content-type", "application/json")
-	if p.apiKey != "" {
-		httpReq.Header.Set("authorization", "Bearer "+p.apiKey)
-	}
-
-	resp, err := p.httpc.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call %s: %w", url, err)
+		// p.display, never the raw URL: it may carry user:pass or ?key=.
+		return nil, fmt.Errorf("call %s: %w", p.display, err)
 	}
 	defer resp.Body.Close()
 
 	var or oaiResp
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&or); err != nil {
-		return nil, fmt.Errorf("decode response (status %d) from %s: %w", resp.StatusCode, url, err)
+		return nil, fmt.Errorf("decode response (status %d) from %s: %w", resp.StatusCode, p.display, err)
 	}
 	if or.Error != nil {
 		return nil, fmt.Errorf("backend error: %s: %s", or.Error.Type, or.Error.Message)

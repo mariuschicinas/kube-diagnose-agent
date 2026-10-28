@@ -8,7 +8,9 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"kube-diagnose-agent/internal/redact"
@@ -19,8 +21,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// tailLines caps how many log lines we pull per container instance.
-const defaultTailLines = 200
+const (
+	// defaultTailLines caps how many log lines we pull per container instance.
+	defaultTailLines = 200
+	// defaultLimitBytes caps how many bytes we pull per container instance. A
+	// line count alone is no bound: 200 lines of 10 MB each is 2 GB in memory
+	// and in the request to the provider. The attacker controls line length.
+	defaultLimitBytes = 64 << 10
+	// maxEvents caps the events section; the newest are kept.
+	maxEvents = 50
+)
 
 // Bundle is the assembled diagnostic context.
 type Bundle struct {
@@ -31,16 +41,20 @@ type Bundle struct {
 
 // Collector wraps a Kubernetes clientset.
 type Collector struct {
-	cs   kubernetes.Interface
-	tail int64
+	cs         kubernetes.Interface
+	tail       int64
+	limitBytes int64
 }
 
-// New returns a Collector. tail <= 0 falls back to the default tail length.
-func New(cs kubernetes.Interface, tail int64) *Collector {
+// New returns a Collector. tail or limitBytes <= 0 fall back to the defaults.
+func New(cs kubernetes.Interface, tail, limitBytes int64) *Collector {
 	if tail <= 0 {
 		tail = defaultTailLines
 	}
-	return &Collector{cs: cs, tail: tail}
+	if limitBytes <= 0 {
+		limitBytes = defaultLimitBytes
+	}
+	return &Collector{cs: cs, tail: tail, limitBytes: limitBytes}
 }
 
 // Markers that fence attacker-influenceable content (container logs) inside the
@@ -144,7 +158,7 @@ func (c *Collector) Gather(ctx context.Context, ns, pod string) (*Bundle, error)
 	b.WriteString(redact.Scrub(describePod(p)))
 
 	b.WriteString("\n=== EVENTS ===\n")
-	b.WriteString(redact.Scrub(c.events(ctx, ns, pod)))
+	b.WriteString(redact.Scrub(c.events(ctx, p)))
 
 	b.WriteString("\n=== OWNER WORKLOAD ===\n")
 	b.WriteString(redact.Scrub(c.owner(ctx, ns, p)))
@@ -289,9 +303,12 @@ func probeStr(p *corev1.Probe) string {
 		kind, p.InitialDelaySeconds, p.PeriodSeconds, p.FailureThreshold)
 }
 
-func (c *Collector) events(ctx context.Context, ns, pod string) string {
-	evs, err := c.cs.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
-		FieldSelector: "involvedObject.name=" + pod,
+func (c *Collector) events(ctx context.Context, p *corev1.Pod) string {
+	// Select by kind and UID as well as name: a StatefulSet pod keeps its name
+	// across incarnations, and a Service or PVC may share it. Events of the
+	// previous incarnation would look current and mislead the diagnosis.
+	evs, err := c.cs.CoreV1().Events(p.Namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod,involvedObject.uid=%s", p.Name, p.UID),
 	})
 	if err != nil {
 		return fmt.Sprintf("(failed to list events: %v)\n", err)
@@ -299,38 +316,84 @@ func (c *Collector) events(ctx context.Context, ns, pod string) string {
 	if len(evs.Items) == 0 {
 		return "(no events found)\n"
 	}
+	items := evs.Items
+	sort.SliceStable(items, func(i, j int) bool {
+		return eventTime(items[i]).Before(eventTime(items[j]))
+	})
 	var b strings.Builder
-	for _, e := range evs.Items {
-		ts := e.LastTimestamp.Time
-		if ts.IsZero() {
-			ts = e.EventTime.Time
-		}
+	if len(items) > maxEvents {
+		fmt.Fprintf(&b, "  (%d older events omitted)\n", len(items)-maxEvents)
+		items = items[len(items)-maxEvents:]
+	}
+	for _, e := range items {
 		// Event messages can echo attacker-controlled strings (image names,
 		// probe output), so they are bounded and neutralized like log content.
-		fmt.Fprintf(&b, "  [%s] %s/%s x%d: %s\n",
-			e.Type, e.Reason, ts.Format("15:04:05"), e.Count, untrusted(e.Message, maxEventBytes))
+		// The full timestamp matters: an event from three days ago is not
+		// evidence about today's restart.
+		fmt.Fprintf(&b, "  [%s] %s at %s x%d: %s\n",
+			e.Type, e.Reason, eventTime(e).Format("2006-01-02T15:04:05Z07:00"), e.Count,
+			untrusted(e.Message, maxEventBytes))
 	}
 	return b.String()
 }
 
+// eventTime is the best available timestamp of an event: LastTimestamp for
+// aggregated core/v1 events, EventTime for events.k8s.io-style ones, then
+// FirstTimestamp.
+func eventTime(e corev1.Event) time.Time {
+	switch {
+	case !e.LastTimestamp.IsZero():
+		return e.LastTimestamp.Time
+	case !e.EventTime.IsZero():
+		return e.EventTime.Time
+	default:
+		return e.FirstTimestamp.Time
+	}
+}
+
+// logs collects current and previous-instance logs for every container of
+// the Pod: init containers (and native sidecars, which are init containers
+// with restartPolicy Always), app containers, and ephemeral debug containers.
+// A Pod stuck in Init:CrashLoopBackOff fails in an init container; without
+// its logs the RCA is a guess.
 func (c *Collector) logs(ctx context.Context, ns string, p *corev1.Pod) string {
 	var b strings.Builder
+	write := func(kind, name string, previous bool) {
+		which := "current"
+		if previous {
+			which = "previous instance"
+		}
+		fmt.Fprintf(&b, "--- %s %s (%s) ---\n", kind, name, which)
+		text := c.containerLog(ctx, ns, p.Name, name, previous)
+		b.WriteString(text)
+		// A log with no trailing newline would glue the next header, or the
+		// fence end marker, onto its last line.
+		if !strings.HasSuffix(text, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	for _, ct := range p.Spec.InitContainers {
+		write("init container", ct.Name, false)
+		write("init container", ct.Name, true)
+	}
 	for _, ct := range p.Spec.Containers {
-		fmt.Fprintf(&b, "--- container %s (current) ---\n", ct.Name)
-		b.WriteString(c.containerLog(ctx, ns, p.Name, ct.Name, false))
+		write("container", ct.Name, false)
 		// Previous instance is the gold mine for CrashLoopBackOff.
-		fmt.Fprintf(&b, "--- container %s (previous instance) ---\n", ct.Name)
-		b.WriteString(c.containerLog(ctx, ns, p.Name, ct.Name, true))
+		write("container", ct.Name, true)
+	}
+	for _, ct := range p.Spec.EphemeralContainers {
+		write("ephemeral container", ct.Name, false)
 	}
 	return b.String()
 }
 
 func (c *Collector) containerLog(ctx context.Context, ns, pod, container string, previous bool) string {
-	tail := c.tail
+	tail, limit := c.tail, c.limitBytes
 	req := c.cs.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{
-		Container: container,
-		Previous:  previous,
-		TailLines: &tail,
+		Container:  container,
+		Previous:   previous,
+		TailLines:  &tail,
+		LimitBytes: &limit,
 	})
 	data, err := req.Do(ctx).Raw()
 	if err != nil {

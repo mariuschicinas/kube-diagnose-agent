@@ -25,6 +25,8 @@ type Options struct {
 	Namespace string
 	Pod       string
 	Tail      int64
+	// MaxLogBytes caps the bytes fetched per container instance (<= 0: default).
+	MaxLogBytes int64
 
 	// LLM backend selection. Provider is "anthropic" or "openai-compat";
 	// BaseURL/APIKeyEnv apply to openai-compat (Ollama, vLLM, LiteLLM, OpenAI).
@@ -42,16 +44,42 @@ type Options struct {
 	AuditWriter  io.Writer
 }
 
-// Run executes the full pipeline. It returns the structured result, the redacted
-// initial bundle (so callers can show exactly what left the cluster), and a
-// trace of the tool calls the agent made during investigation.
-func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*llm.Result, string, []string, error) {
-	bundle, err := collect.New(cs, o.Tail).Gather(ctx, o.Namespace, o.Pod)
-	if err != nil {
-		return nil, "", nil, err
+// Report is everything a run produced, whether or not it succeeded.
+type Report struct {
+	Result *llm.Result
+	// Bundle is the redacted bundle that was sent, so callers can show exactly
+	// what left the cluster. Empty if collection itself failed.
+	Bundle string
+	// Trace lists the tool calls the agent made, in order.
+	Trace []string
+	// Denied lists tool calls refused by the namespace allowlist — an attempt
+	// is itself a tampering signal and is surfaced even when the run fails.
+	Denied []string
+	// AuditErr is non-nil when an audit record was requested but could not be
+	// written. The run is not failed for it; the caller decides.
+	AuditErr error
+}
+
+// Run executes the full pipeline. The Report is never nil: on error it still
+// carries whatever was produced before the failure.
+func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Report, error) {
+	rep := &Report{}
+
+	// The recorder exists before anything else happens, so a 403 from the API
+	// server or a missing API key still leaves an audit record.
+	rec := audit.New(o.AgentVersion, o.Namespace, o.Pod, o.Provider, o.Model,
+		o.Initiator, llm.SystemPrompt(), llm.ToolSystemPrompt(), o.MaxIterations)
+	finish := func(err error) error {
+		rep.AuditErr = writeAudit(o.AuditWriter, rec, rep.Result, err)
+		return err
 	}
 
-	clean := redact.Scrub(bundle.Text)
+	bundle, err := collect.New(cs, o.Tail, o.MaxLogBytes).Gather(ctx, o.Namespace, o.Pod)
+	if err != nil {
+		return rep, finish(err)
+	}
+	rep.Bundle = redact.Scrub(bundle.Text)
+	rec.SetBundle(rep.Bundle)
 
 	client, err := llm.NewProvider(llm.Config{
 		Kind:          o.Provider,
@@ -62,12 +90,10 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*llm.Result, 
 		MaxIterations: o.MaxIterations,
 	})
 	if err != nil {
-		return nil, clean, nil, err
+		return rep, finish(err)
 	}
-
-	rec := audit.New(o.AgentVersion, o.Namespace, o.Pod, o.Provider, o.Model,
-		o.Initiator, llm.SystemPrompt(), o.MaxIterations)
-	rec.SetBundle(clean)
+	info := client.Info()
+	rec.SetProvider(info.Kind, info.Model, info.Endpoint)
 
 	var provider llm.ToolProvider
 	var tp *tools.Provider
@@ -79,43 +105,42 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*llm.Result, 
 		provider = tp
 	}
 
-	res, trace, err := client.Diagnose(ctx, clean, provider)
-	if err != nil {
-		writeAudit(o.AuditWriter, rec, nil, "")
-		return nil, clean, trace, err
-	}
+	res, trace, err := client.Diagnose(ctx, rep.Bundle, provider)
+	rep.Result, rep.Trace = res, trace
 	if tp != nil {
-		if denied := tp.DeniedCalls(); len(denied) > 0 {
-			warn := "SECURITY: the agent attempted to read outside namespace " + o.Namespace +
-				" and was refused: " + strings.Join(denied, ", ") +
-				". This can indicate prompt injection via application logs — inspect the bundle."
-			if res != nil {
-				res.Notes = strings.TrimSpace(warn + " " + res.Notes)
-			}
-		}
+		rep.Denied = tp.DeniedCalls()
 	}
-
-	writeAudit(o.AuditWriter, rec, res, marshalResult(res))
-	return res, clean, trace, nil
+	if err != nil {
+		return rep, finish(err)
+	}
+	if len(rep.Denied) > 0 && res != nil {
+		res.Notes = strings.TrimSpace(DeniedWarning(o.Namespace, rep.Denied) + " " + res.Notes)
+	}
+	return rep, finish(nil)
 }
 
-// writeAudit finalizes and emits the audit record (best-effort; audit failure
-// must not fail a diagnosis).
-func writeAudit(w io.Writer, rec *audit.Recorder, res *llm.Result, resultJSON string) {
+// DeniedWarning is the SECURITY notice for refused cross-namespace reads. It
+// is placed in the RCA notes on success and printed by the CLI on failure.
+func DeniedWarning(ns string, denied []string) string {
+	return "SECURITY: the agent attempted to read outside namespace " + ns +
+		" and was refused: " + strings.Join(denied, ", ") +
+		". This can indicate prompt injection via application logs — inspect the bundle."
+}
+
+// writeAudit finalizes and emits the audit record. The error is returned, not
+// swallowed: a full disk must not silently produce a run with no record.
+func writeAudit(w io.Writer, rec *audit.Recorder, res *llm.Result, runErr error) error {
 	if w == nil {
-		return
+		return nil
 	}
-	summary, insufficient := "", false
+	summary, insufficient, resultJSON := "", false, ""
 	if res != nil {
-		summary, insufficient = res.Summary, res.InsufficientEvidence
+		summary, insufficient, resultJSON = res.Summary, res.InsufficientEvidence, marshalResult(res)
 	}
-	_ = audit.WriteJSON(w, rec.Finish(summary, insufficient, resultJSON))
+	return audit.WriteJSON(w, rec.Finish(summary, insufficient, resultJSON, runErr))
 }
 
 func marshalResult(r *llm.Result) string {
-	if r == nil {
-		return ""
-	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return ""
@@ -123,14 +148,21 @@ func marshalResult(r *llm.Result) string {
 	return string(b)
 }
 
-// RenderJSON writes the result as indented JSON. HTML escaping is off: the
-// consumer is a pipeline, not a browser, and "<" for "<" only obscures
-// the evidence.
-func RenderJSON(w io.Writer, r *llm.Result) error {
+// RenderJSON writes the result and the tool trace as indented JSON:
+// {"result": {...}, "tool_trace": [...]}. HTML escaping is off: the consumer
+// is a pipeline, not a browser, and "<" for "<" only obscures the
+// evidence.
+func RenderJSON(w io.Writer, r *llm.Result, trace []string) error {
+	if trace == nil {
+		trace = []string{}
+	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	return enc.Encode(r)
+	return enc.Encode(struct {
+		Result    *llm.Result `json:"result"`
+		ToolTrace []string    `json:"tool_trace"`
+	}{r, trace})
 }
 
 // block prepares one model-derived value for the terminal: control characters
