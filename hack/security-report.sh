@@ -169,7 +169,7 @@ go mod verify >> "$REPORT" 2>&1 || echo "(verify failed — investigate)" >> "$R
   echo "| No write access to the cluster | ServiceAccount has no write verbs | **RBAC** (\`deploy/rbac.yaml\`) |"
   echo "| No cross-namespace reads | Tool calls outside the target namespace are refused before any API call | **Code** (\`internal/tools\`) |"
   echo "| No arbitrary command execution | 3 typed, scoped read tools; no exec/shell tool exists | **Code** (tool surface) |"
-  echo "| Secrets never leave the cluster | Every byte is scrubbed before egress | **Code** (\`internal/redact\`) |"
+  echo "| Secrets are masked before egress (best-effort) | Every section is scrubbed for known credential shapes before it leaves the process; unrecognisable high-entropy secrets can still pass | **Code** (\`internal/redact\`) |"
   echo "| Logs cannot issue instructions | Untrusted fence + neutralized control syntax + system-prompt trust boundary | **Prompt + code** (probabilistic) |"
   echo "| Bounded investigation | Hard cap on tool-call rounds | **Code** (\`--max-iterations\`) |"
   echo "| Auditability | Every tool call traced; refusals raised as SECURITY warnings | **Code** (\`internal/diagnose\`) |"

@@ -2,14 +2,23 @@
 // BEFORE it is sent to an external LLM. It is a fixed choke point that every byte
 // passes through on the way out — the architectural point, not an afterthought.
 //
-// The ruleset is high-precision by design: every pattern keys off a distinctive
-// prefix or structure, so false positives are rare. That is deliberate — a
-// redactor that mangles ordinary log text trains people to distrust it. It is
-// therefore also NOT exhaustive: a high-entropy secret with no recognisable
-// shape (many Azure AD client secrets, a bespoke token) can still slip through.
-// Redaction is defence in depth, not a guarantee; the hard boundaries are RBAC
+// The ruleset keys off distinctive prefixes (provider tokens) and on the common
+// ways credentials are spelled in logs and config dumps: env-style
+// DB_PASSWORD=, YAML/JSON "password": "...", connection strings (Pwd=), CLI
+// flags (--password x), Authorization headers, cookies. A crashing app that
+// prints its environment or config is the typical leak, so those shapes must be
+// covered even at the cost of the occasional over-redaction of a harmless
+// "token_ttl=3600".
+//
+// It is still NOT exhaustive: a high-entropy secret with no recognisable shape
+// (many Azure AD client secrets, a bespoke token) can slip through. Redaction is
+// best-effort defence in depth, not a guarantee; the hard boundaries are RBAC
 // and the namespace allowlist. Run with --show-bundle to see exactly what the
 // model would receive, and extend these patterns for your environment.
+//
+// Scrub is applied per section while the bundle is assembled (so no rule can
+// span from one section into another and swallow structure such as the
+// untrusted-log fence) and once more on the whole bundle as a second pass.
 package redact
 
 import "regexp"
@@ -19,12 +28,21 @@ type rule struct {
 	repl string
 }
 
+// sensitiveKey matches an identifier that contains a secret-ish word. The word
+// must end the identifier or be followed by a separator, so DB_PASSWORD,
+// POSTGRES_PASSWORD, aws_secret_access_key, Pwd, api-key and token_ttl match,
+// while max_tokens or tokenizer do not.
+const sensitiveKey = `(?i)([A-Za-z0-9_.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)(?:[_.-][A-Za-z0-9_.-]*)?)`
+
 // rules are applied in order. Provider-specific patterns run before the generic
 // key=value catch-all so the more precise placeholder wins.
 var rules = []rule{
 	// --- structural / cross-provider ---
-	// Private key blocks (PEM) — covers RSA, EC, OPENSSH, and GCP SA keys.
-	{regexp.MustCompile(`(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----`), "[REDACTED_PRIVATE_KEY]"},
+	// Private key blocks (PEM) — covers RSA, EC, OPENSSH, and GCP SA keys. The
+	// body is restricted to base64 + line breaks (no spaces, no punctuation),
+	// so a BEGIN line in one place and an END line far away can never swallow
+	// the prose — or the bundle structure — in between.
+	{regexp.MustCompile(`-----BEGIN [^-\n]{0,40}PRIVATE KEY-----[A-Za-z0-9+/=\r\n]*-----END [^-\n]{0,40}PRIVATE KEY-----`), "[REDACTED_PRIVATE_KEY]"},
 	// JWTs (header.payload.signature, base64url).
 	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}`), "[REDACTED_JWT]"},
 
@@ -52,18 +70,28 @@ var rules = []rule{
 	{regexp.MustCompile(`https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+`), "[REDACTED_SLACK_WEBHOOK]"},
 
 	// --- LLM provider keys (a crashing app may print its own key in a log line) ---
-	// Anthropic (checked before the broader OpenAI rule).
-	{regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{20,}`), "[REDACTED_LLM_KEY]"},
-	// OpenAI (sk- and sk-proj-).
-	{regexp.MustCompile(`sk-(proj-)?[A-Za-z0-9]{20,}`), "[REDACTED_LLM_KEY]"},
+	// Anthropic (sk-ant-...) and OpenAI (sk-..., sk-proj-..., sk-svcacct-...).
+	// Real keys contain '-' and '_', so the charset must include them.
+	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`), "[REDACTED_LLM_KEY]"},
 
 	// --- generic ---
-	// Bearer tokens in headers / logs.
-	{regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]+`), "Bearer [REDACTED_TOKEN]"},
+	// Authorization headers / log echoes: Bearer and Basic. The charset covers
+	// base64 (+ / =) so the tail of a token cannot survive. The minimum length
+	// keeps prose like "the bearer of" intact.
+	{regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`), "${1} [REDACTED_TOKEN]"},
+	// Cookie headers carry session tokens.
+	{regexp.MustCompile(`(?i)\b(cookie|set-cookie):[ \t]*[^\r\n]+`), "${1}: [REDACTED]"},
 	// Credentials embedded in URLs: scheme://user:pass@host -> mask the password.
 	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]+:)([^@/\s]+)(@)`), "${1}[REDACTED]${3}"},
-	// key=value / key: "value" where the key name looks sensitive.
-	{regexp.MustCompile(`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key)(["']?\s*[:=]\s*["']?)([^\s"',}]+)`), "${1}${2}[REDACTED]"},
+	// key=value / key: "value" where the key name looks sensitive. Three
+	// spellings of the value — double-quoted, single-quoted, bare — so a value
+	// containing ',' or ' ' inside quotes is masked whole, and the quotes are
+	// kept so the surrounding JSON/YAML stays readable.
+	{regexp.MustCompile(sensitiveKey + `(\s*["']?\s*[:=]\s*")([^"]*)(")`), "${1}${2}[REDACTED]${4}"},
+	{regexp.MustCompile(sensitiveKey + `(\s*["']?\s*[:=]\s*')([^']*)(')`), "${1}${2}[REDACTED]${4}"},
+	{regexp.MustCompile(sensitiveKey + `(\s*["']?\s*[:=]\s*)([^\s"',;}&]+)`), "${1}${2}[REDACTED]"},
+	// CLI flags with a space-separated value: --password hunter2, -token x.
+	{regexp.MustCompile(`(?i)(--?(?:password|passwd|pwd|token|api-?key|secret|client-secret) +)([^\s"']+)`), "${1}[REDACTED]"},
 	// Email addresses (PII).
 	{regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`), "[REDACTED_EMAIL]"},
 }

@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 
+	"kube-diagnose-agent/internal/redact"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -75,21 +77,25 @@ func (c *Collector) Gather(ctx context.Context, ns, pod string) (*Bundle, error)
 		return nil, fmt.Errorf("get pod %s/%s: %w", ns, pod, err)
 	}
 
+	// Each section is redacted on its own BEFORE the sections are joined and
+	// the fence markers are added. A redaction rule can therefore never match
+	// across a section boundary and swallow the structure between (the caller
+	// scrubs the assembled bundle once more as a second pass).
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== POD %s/%s ===\n", ns, pod)
-	b.WriteString(describePod(p))
+	b.WriteString(redact.Scrub(describePod(p)))
 
 	b.WriteString("\n=== EVENTS ===\n")
-	b.WriteString(c.events(ctx, ns, pod))
+	b.WriteString(redact.Scrub(c.events(ctx, ns, pod)))
 
 	b.WriteString("\n=== OWNER WORKLOAD ===\n")
-	b.WriteString(c.owner(ctx, ns, p))
+	b.WriteString(redact.Scrub(c.owner(ctx, ns, p)))
 
 	// Container logs are attacker-influenceable: fence and neutralize them.
 	b.WriteString("\n=== CONTAINER LOGS (UNTRUSTED DATA) ===\n")
 	b.WriteString(untrustedNotice)
 	b.WriteString(untrustedStart + "\n")
-	b.WriteString(neutralize(c.logs(ctx, ns, p)))
+	b.WriteString(neutralize(redact.Scrub(c.logs(ctx, ns, p))))
 	b.WriteString(untrustedEnd + "\n")
 
 	return &Bundle{Namespace: ns, Pod: pod, Text: b.String()}, nil

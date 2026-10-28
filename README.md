@@ -44,13 +44,17 @@ could defend to a regulated financial-services security team. Two principles:
    checks both for write verbs and for drift against the resources the code
    actually reads.
 
-2. **Redaction is a fixed choke point.** Every byte of the bundle passes through
-   [`internal/redact`](internal/redact/redact.go) before it leaves the process:
-   private keys, JWTs, cloud credentials (AWS, GCP, Azure), source-control and
-   CI tokens (GitHub, GitLab, npm), Slack tokens, LLM API keys, bearer tokens,
-   URL-embedded credentials, secret-looking `key=value` pairs, and emails are
-   masked. Run with
-   `--show-bundle` to see exactly what was sent.
+2. **Redaction is a fixed choke point.** Every section of the bundle passes
+   through [`internal/redact`](internal/redact/redact.go) before it leaves the
+   process: private keys, JWTs, cloud credentials (AWS, GCP, Azure),
+   source-control and CI tokens (GitHub, GitLab, npm), Slack tokens, LLM API
+   keys, `Bearer`/`Basic`/cookie headers, URL-embedded credentials, and the
+   usual credential spellings a crashing app dumps (`DB_PASSWORD=`,
+   `"api_key": "..."`, `Pwd=` in connection strings, `--password x`), plus
+   emails. Redaction is **best-effort defence in depth**, not a guarantee: a
+   high-entropy secret with no recognisable shape can still pass. The hard
+   boundaries are RBAC and the namespace allowlist. Run with `--show-bundle`
+   to see exactly what was sent, and extend the rules for your environment.
 
 3. **Application logs are treated as untrusted input.** Logs and event messages
    are attacker-influenceable: anyone who can get text into an app's output can
