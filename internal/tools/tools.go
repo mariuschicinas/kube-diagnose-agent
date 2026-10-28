@@ -208,11 +208,19 @@ func (p *Provider) getEndpoints(ctx context.Context, t target) (string, error) {
 	if ready == 0 {
 		b.WriteString("=> Service has NO ready endpoints (no backing Pods are Ready)\n")
 	}
-	if len(addrs) > 0 {
+	if len(addrs) > maxAddresses {
+		// A Service with thousands of endpoints must not produce a tool result
+		// of thousands of addresses; the count is the evidence, not the list.
+		fmt.Fprintf(&b, "ready addresses (first %d of %d): %s\n", maxAddresses, len(addrs),
+			strings.Join(addrs[:maxAddresses], ", "))
+	} else if len(addrs) > 0 {
 		fmt.Fprintf(&b, "ready addresses: %s\n", strings.Join(addrs, ", "))
 	}
 	return b.String(), nil
 }
+
+// maxAddresses caps the ready addresses listed in a get_endpoints result.
+const maxAddresses = 20
 
 func labelString(m map[string]string) string {
 	keys := make([]string, 0, len(m))

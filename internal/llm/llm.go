@@ -16,6 +16,10 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,13 +33,32 @@ var systemPrompt string
 // hash it — the prompt version is part of what makes a run explainable.
 func SystemPrompt() string { return systemPrompt }
 
+// ToolSystemPrompt returns the system prompt as sent on rounds where tools are
+// offered (base prompt + tool guidance). The audit layer hashes this one too:
+// a change to the tool guidance changes model behaviour just as much.
+func ToolSystemPrompt() string { return systemFor(true) }
+
 const (
-	defaultTimeout = 90 * time.Second
+	// CallTimeout bounds one HTTP call to the backend. The run deadline in
+	// cmd/agent is derived from it and the number of rounds.
+	CallTimeout = 90 * time.Second
 
 	// maxResponseBytes bounds how much of an LLM backend's response body we
 	// will read. A hostile or broken --base-url endpoint must not be able to
 	// exhaust memory; an RCA is a few KB.
 	maxResponseBytes = 8 << 20
+
+	// maxToolCallsPerRound caps how many tool calls one model response may
+	// trigger. The round budget (--max-iterations) bounds rounds, not calls;
+	// without this one response carrying 50 calls would mean 50 cluster reads.
+	maxToolCallsPerRound = 5
+
+	// maxLikelyCauses is what the prompt asks for; a longer list is cut.
+	maxLikelyCauses = 3
+
+	// maxAttempts is the number of HTTP attempts per call (1 + retries) on
+	// transient failures: 429, 5xx, 529 and network errors.
+	maxAttempts = 3
 
 	// DefaultAnthropicModel is used when --provider=anthropic.
 	DefaultAnthropicModel = "claude-sonnet-4-6"
@@ -43,6 +66,12 @@ const (
 	// pass --model explicitly since the served name varies.
 	DefaultOpenAICompatModel = "qwen2.5:14b"
 )
+
+// retryBase is the first backoff delay (doubled per attempt). A variable so
+// tests can zero it.
+var retryBase = defaultRetryBase
+
+const defaultRetryBase = time.Second
 
 // toolGuidance is appended to the system prompt ONLY on rounds where read-only
 // tools are actually offered. Keeping it out of the base prompt means
@@ -74,6 +103,55 @@ type Cause struct {
 	Evidence   []string `json:"evidence"`
 }
 
+// UnmarshalJSON accepts confidence as a string ("high") or a number (0.8, 80)
+// — smaller models produce both — and normalises it to high|medium|low, or
+// "unknown" when it is neither. A single odd field must not fail the whole RCA.
+func (c *Cause) UnmarshalJSON(b []byte) error {
+	var aux struct {
+		Cause      string          `json:"cause"`
+		Confidence json.RawMessage `json:"confidence"`
+		Evidence   []string        `json:"evidence"`
+	}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	c.Cause = aux.Cause
+	c.Evidence = aux.Evidence
+	c.Confidence = normalizeConfidence(aux.Confidence)
+	return nil
+}
+
+func normalizeConfidence(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.ToLower(strings.TrimSpace(s))
+		switch {
+		case strings.Contains(s, "high"):
+			return "high"
+		case strings.Contains(s, "med"):
+			return "medium"
+		case strings.Contains(s, "low"):
+			return "low"
+		}
+		return "unknown"
+	}
+	var n float64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		if n > 1 { // percent
+			n /= 100
+		}
+		switch {
+		case n >= 0.75:
+			return "high"
+		case n >= 0.4:
+			return "medium"
+		case n >= 0:
+			return "low"
+		}
+	}
+	return "unknown"
+}
+
 // Result is the structured RCA returned by the model.
 type Result struct {
 	Summary              string   `json:"summary"`
@@ -100,10 +178,20 @@ type ToolProvider interface {
 	Run(ctx context.Context, name string, input json.RawMessage) (string, error)
 }
 
+// ProviderInfo is what a Provider resolved from its Config: the model actually
+// requested and the endpoint actually called (credentials and query stripped).
+// The audit record stores these, not the flags the operator typed.
+type ProviderInfo struct {
+	Kind     string
+	Model    string
+	Endpoint string
+}
+
 // Provider is an LLM backend capable of running the diagnostic tool-use loop.
 // It returns the parsed RCA plus a trace of the tool calls made (for audit).
 type Provider interface {
 	Diagnose(ctx context.Context, bundle string, tp ToolProvider) (*Result, []string, error)
+	Info() ProviderInfo
 }
 
 // Config selects and configures a Provider.
@@ -177,10 +265,17 @@ func parseResultText(text string) (*Result, error) {
 	return &out, nil
 }
 
-// normalizeResult canonicalises every model-supplied string in place.
+// normalizeResult canonicalises every model-supplied string in place and
+// enforces the structural limits the prompt asks for.
 func normalizeResult(r *Result) {
 	r.Summary = sanitize.Normalize(r.Summary)
 	r.Notes = sanitize.Normalize(r.Notes)
+	if len(r.LikelyCauses) > maxLikelyCauses {
+		dropped := len(r.LikelyCauses) - maxLikelyCauses
+		r.LikelyCauses = r.LikelyCauses[:maxLikelyCauses]
+		r.Notes = strings.TrimSpace(fmt.Sprintf("Model listed %d extra cause(s) beyond the %d requested; they were dropped. %s",
+			dropped, maxLikelyCauses, r.Notes))
+	}
 	for i := range r.LikelyCauses {
 		c := &r.LikelyCauses[i]
 		c.Cause = sanitize.Normalize(c.Cause)
@@ -210,7 +305,9 @@ func excerpt(text string) string {
 // extractJSON returns the last balanced top-level {...} object in s. The model's
 // final answer is always last; any earlier JSON-looking text (e.g. a simulated
 // tool call, or narration) is ignored. Brace matching is string-aware so braces
-// inside string values don't throw off the depth count.
+// inside string values don't throw off the depth count — but only inside an
+// object: a stray quote in the prose around the JSON ("the "db service) must
+// not flip the string state and hide the real object.
 //
 // This matters more, not less, with smaller self-hosted models: they narrate
 // around their JSON far more often than frontier models do.
@@ -235,7 +332,9 @@ func extractJSON(s string) string {
 		}
 		switch c {
 		case '"':
-			inStr = true
+			if depth > 0 {
+				inStr = true
+			}
 		case '{':
 			if depth == 0 {
 				start = i
@@ -254,6 +353,107 @@ func extractJSON(s string) string {
 		return best
 	}
 	return strings.TrimSpace(s)
+}
+
+// doWithRetry performs an HTTP call with bounded retries on transient
+// failures: network errors, 429, 5xx and Anthropic's 529. build is called per
+// attempt so the body reader is fresh. Retry-After is honoured (capped), else
+// the delay doubles from retryBase. The last response is returned as-is so the
+// caller reports its status.
+func doWithRetry(ctx context.Context, httpc *http.Client, build func() (*http.Request, error)) (*http.Response, error) {
+	var lastErr error
+	delay := retryBase
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, delay); err != nil {
+				return nil, fmt.Errorf("%w (last error: %v)", err, lastErr)
+			}
+			delay *= 2
+		}
+		req, err := build()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := httpc.Do(req)
+		if err != nil {
+			// net/http embeds the request URL in its error — with the query
+			// string, which may carry a key. Strip it before the error can be
+			// printed or audited.
+			if ue, ok := err.(*url.Error); ok {
+				ue.URL = redactURL(ue.URL)
+			}
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if !retryableStatus(resp.StatusCode) || attempt == maxAttempts-1 {
+			return resp, nil
+		}
+		lastErr = fmt.Errorf("backend returned status %d", resp.StatusCode)
+		if ra := retryAfter(resp.Header); ra > 0 {
+			delay = ra
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
+		return true
+	}
+	return false
+}
+
+// retryAfter parses a Retry-After header given in seconds; 0 when absent or
+// unusable. Capped so a hostile backend cannot park the run.
+func retryAfter(h http.Header) time.Duration {
+	v := h.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	d := time.Duration(secs) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// redactURL strips user info and the query string from a URL before it is
+// shown in an error or stored in the audit record: both can carry credentials
+// (https://user:pass@gw/v1, ?key=...).
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(unparseable url)"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // Compile-time assertions: both backends must satisfy Provider.

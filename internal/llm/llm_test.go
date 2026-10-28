@@ -46,6 +46,60 @@ func TestParseResultTextRejectsEmptyRCA(t *testing.T) {
 	}
 }
 
+// Narration around the JSON may contain an unbalanced quote; it must not flip
+// the string state and hide the real object.
+func TestExtractJSONIgnoresQuotesOutsideObjects(t *testing.T) {
+	text := `Looking at the "db service, I conclude:
+{"summary":"db missing","likely_causes":[{"cause":"x","confidence":"high","evidence":["a {brace} in a string"]}]}
+Done.`
+	res, err := parseResultText(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary != "db missing" {
+		t.Fatalf("summary = %q", res.Summary)
+	}
+}
+
+// Smaller models return confidence as a number, or an unexpected word; neither
+// may fail the whole RCA.
+func TestConfidenceIsNormalised(t *testing.T) {
+	text := `{"summary":"s","likely_causes":[
+		{"cause":"a","confidence":0.9},
+		{"cause":"b","confidence":55},
+		{"cause":"c","confidence":"Very High"},
+		{"cause":"d","confidence":"maybe"}]}`
+	res, err := parseResultText(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"high", "medium", "high"} // the 4th cause is cut (max 3)
+	for i, w := range want {
+		if res.LikelyCauses[i].Confidence != w {
+			t.Errorf("cause %d: confidence = %q, want %q", i, res.LikelyCauses[i].Confidence, w)
+		}
+	}
+	if len(res.LikelyCauses) != maxLikelyCauses || !strings.Contains(res.Notes, "extra cause") {
+		t.Errorf("causes not capped at %d with a note: %d causes, notes=%q", maxLikelyCauses, len(res.LikelyCauses), res.Notes)
+	}
+	one, _ := parseResultText(`{"summary":"s","likely_causes":[{"cause":"d","confidence":"maybe"}]}`)
+	if one.LikelyCauses[0].Confidence != "unknown" {
+		t.Errorf("unparseable confidence = %q, want unknown", one.LikelyCauses[0].Confidence)
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	cases := map[string]string{
+		"https://user:pass@gw.example/v1?key=abc#f": "https://gw.example/v1",
+		"http://localhost:11434/v1":                 "http://localhost:11434/v1",
+	}
+	for in, want := range cases {
+		if got := redactURL(in); got != want {
+			t.Errorf("redactURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // The probe and exec rules are load-bearing: they correct reasoning errors
 // observed in real runs. Guard them against being edited out.
 func TestSystemPromptKeepsKubernetesFacts(t *testing.T) {
